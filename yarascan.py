@@ -1,4 +1,4 @@
-#!/usr/bin/env /usr/bin/python3
+#!/usr/bin/env python3
 import os
 import yara
 import sys
@@ -42,7 +42,7 @@ opt_parser.add_option("-c", "--context", type=int, action="store",dest="context"
     default=5, help="number of bytes of context before and after matches")
 opt_parser.add_option("-l", "--line", action="store_true",dest="line",
     default=False, help="Output entire line match occurs on")
-opt_parser.add_option("-j", "--json", action="store_true",dest="json",
+opt_parser.add_option("-j", "--json", action="store",dest="json",
     default=False, help="json output")
 opt_parser.add_option("-n", "--negative", action="store_true",dest="negative",
     default=False, help="Output files having no matches")
@@ -63,7 +63,7 @@ def percent_printable(string):
         return 0
     printable_count = 0
     for c in string:
-        if (c <= 0x7f and c >= 20) or c == b'\n' or c == b'\r' or c == b'\t':
+        if (c <= 0x7f and c >= 0x20) or c == b'\n' or c == b'\r' or c == b'\t':
             printable_count += 1
     return float(printable_count)/float(len(string))
 
@@ -170,36 +170,36 @@ def human_size(nbytes):
     return '%s %s' % (f, suffixes[i])
 
 def filter_match(match, fname):
-    if 'file_name' in match.meta:
-        passed = False         
-        for search in match.meta['file_name'].lower().split(','):
-            if 'sub:' in search:
-                if search.replace('sub:', '') in fname.lower():
-                    passed = True
-            else:
-                if search == fname.lower():
-                    passed = True
-        if not passed:
-            return True
-
-    if 'full_path' in match.meta:
-        passed = False
-        for search in match.meta['full_path'].lower().split(','):
-            if 'sub:' in search:
-                if search.replace('sub:', '') in fname.lower():
-                    passed = True
-            else:
-                if search == fname.lower():
-                    passed = True
-        if not passed:
-            return True
+    for key in ['file_name', 'full_path']:
+        if key in match.meta:
+            passed = False         
+            for search in match.meta[key].lower().split(','):
+                negate = False
+                if search.startswith('!'):
+                    search = search[1:]
+                    negate = True
+                if 'sub:' in search:
+                    ns = search.replace('sub:', '')
+                    if ns in fname.lower() and not negate or (not ns in fname.lower() and negate):
+                        passed = True
+                else:
+                    if search == fname.lower() and not negate or (search != fname.lower() and negate):
+                        passed = True
+            if not passed:
+                #print(f'meta filtered {fname} on {key}')
+                return True
 
     if 'file_ext' in match.meta:
         passed = False
         for search in match.meta['file_ext'].lower().split(','):
-            if fname.lower().endswith(search):
+            negate = False
+            if search.startswith('!'):
+                search = search[1:]
+                negate = True
+            if fname.lower().endswith(search) and not negate or (not fname.lower().endswith(search) and negate):
                 passed = True
         if not passed:
+            #print(f'meta filtered {fname} on file_ext')
             return True
         
     return False
@@ -447,7 +447,7 @@ def format_string_output(string, offset=None, fname=None, context=0, line=False)
             
     if printable_wide.match(string):
         rtn = string.decode('utf-16le')
-    elif percent_printable(before + string + after) > .8:
+    elif percent_printable(before + string + after) > .75:
         rtn = clean_string(string)
     else:
         rtn = hexlify(string)
@@ -663,8 +663,10 @@ if __name__ == '__main__':
             matches = {}
             for match in res['matches']:
                 matches[match.rule] = match.meta
-            results[res['fname']] = matches
-        print(json.dumps(results))
+            if matches:
+                results[res['fname']] = matches
+        with open(options.json, 'w') as fp:
+            json.dump(results, fp)
     else:
         while not result_queue.empty():
             res = result_queue.get()
