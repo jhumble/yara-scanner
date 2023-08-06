@@ -46,6 +46,8 @@ opt_parser.add_option("-j", "--json", action="store",dest="json",
     default=False, help="json output")
 opt_parser.add_option("-n", "--negative", action="store_true",dest="negative",
     default=False, help="Output files having no matches")
+opt_parser.add_option("-w", "--wide", action="store_true",dest="wide",
+    default=False, help="Mark matching wide/utf-16le strings")
 opt_parser.add_option("--max-strings", action="store",dest="max_strings",type=int,
     default=5, help="Max strings to print per rule")
 opt_parser.add_option("--max-offsets", action="store",dest="max_offsets",type=int,
@@ -445,8 +447,10 @@ def format_string_output(string, offset=None, fname=None, context=0, line=False)
             import traceback
             print(traceback.format_exc())
             
+    wide = False 
     if printable_wide.match(string):
         rtn = string.decode('utf-16le')
+        wide = True
     elif percent_printable(before + string + after) > .75:
         rtn = clean_string(string)
     else:
@@ -459,7 +463,7 @@ def format_string_output(string, offset=None, fname=None, context=0, line=False)
             rtn = '%s %s%s%s %s' % (hexlify(before), bcolors.FAIL, rtn, bcolors.ENDC, hexlify(after))
         else:
             rtn = '%s%s%s%s%s' % (clean_string(before), bcolors.FAIL, rtn, bcolors.ENDC, clean_string(after))
-    return raw_bytes, hex_format, rtn
+    return raw_bytes, hex_format, wide, rtn
     
 
 def preexec_function():
@@ -553,6 +557,19 @@ def prefilter(cache_dir, rule_path):
         matching |= matching_set
     print('done')
     return [id_to_path[str(fid)] for fid in matching]
+
+# handle backward incompatible change introduced in v.4.3.0: https://github.com/VirusTotal/yara-python/releases/tag/v4.3.0
+def iterate_matches(matches):
+    #pre v4.3.0
+    for matchobj in matches:
+        if type(matchobj) is tuple:
+            # (<offset>, <string identifier>, <string data>)
+            yield matchobj[0], matchobj[1], matchobj[2]
+        # >= v4.3.0
+        else:
+            name = matchobj.identifier
+            for string in matchobj.instances:
+                yield string.offset, name, string.matched_data
 
 
 if __name__ == '__main__':
@@ -674,39 +691,42 @@ if __name__ == '__main__':
                 continue
             header = False
 
-            for match in res['matches']:
-                if not filter_match(match, res['fname']):
+            for matchobj in res['matches']:
+                if not filter_match(matchobj, res['fname']):
                     if not header:
                         print(res['fname'])# + '\t' + str(score_matches(res['matches'])))
                         header = True
                     if options.categorize_dir:
-                        d = os.path.join(options.categorize_dir, match.rule)
+                        d = os.path.join(options.categorize_dir, matchobj.rule)
                         os.makedirs(d, exist_ok=True)
                         shutil.copy(res['fname'], d) 
                     strings = {}
                     if options.strings:
-                        for s in match.strings:
-                            offset = hex(s[0]).strip('L')
-                            name = s[1]
-                            raw_bytes, printable, string = format_string_output(string=s[2], offset=s[0], fname=res['fname'], context=options.context, line=options.line)
+                        for offset, name, data in iterate_matches(matchobj.strings):
+                            raw_bytes, printable, wide, string = format_string_output(string=data, offset=offset, fname=res['fname'], context=options.context, line=options.line)
                             string = string.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                             if name not in strings:
                                 strings[name] = {}
                             if string not in strings[name]:
-                                strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable}
+                                if wide:
+                                    strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': True}
+                                else:
+                                    strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': False}
                             if offset not in strings[name][string]['offsets']:
                                 strings[name][string]['offsets'].append(offset)
                     
-                    print('    %s/%s' % (match.namespace, match.rule))
+                    print('    %s/%s' % (matchobj.namespace, matchobj.rule))
                         
                     if options.strings:
                         for name, string_dict in strings.items():
                             for string in list(string_dict.keys())[:options.max_strings]:
                                 offsets = string_dict[string]['offsets']
                                 for offset in offsets[:options.max_offsets]:
+                                    if string_dict[string]['wide'] and options.wide:
+                                        string = string + bcolors.OKBLUE + ' utf-16le' + bcolors.ENDC
                                     if options.offset: 
                                         try:
-                                            print('        %s:%s:    %s' % (name, offset, string))
+                                            print('        %s:0x%x:    %s' % (name, offset, string))
                                         except Exception as e:
                                             print('error: %s' % (e))
                                     else:
