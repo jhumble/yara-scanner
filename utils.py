@@ -1,6 +1,8 @@
 import os
 import glob
 import binascii
+import sys
+sys.setrecursionlimit(50000)
 
 def recursive_all_files(directory, ext_filter=None):
     all_files = []

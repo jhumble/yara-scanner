@@ -20,6 +20,8 @@ from multiprocessing import Pool, cpu_count
 from hashlib import md5
 from pprint import pprint
 
+
+
 usage = "yarascan.py [-S SIGNATURES_DIR] [-t] [FILE_OR_DIR]..." 
 opt_parser = OptionParser(usage=usage)
 opt_parser.add_option("-S", "--signatures", action="store",dest="signatures",
@@ -121,6 +123,7 @@ def worker():
     global match_count
     global lock
 
+    yara.set_config(max_match_data=4096)
     #print 'worker %s started' % (current_thread())
     while True: #not scan_queue.empty():
         if TERMINATE_EARLY:
