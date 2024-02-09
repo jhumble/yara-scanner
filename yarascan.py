@@ -175,41 +175,55 @@ def human_size(nbytes):
     return '%s %s' % (f, suffixes[i])
 
 def filter_match(match, fname):
-    for key in ['file_name', 'full_path']:
-        if key in match.meta:
-            passed = False         
-            for search in match.meta[key].lower().split(','):
-                if key == 'file_name':
-                    fname = os.path.basename(fname)
+    try:
+        for key in ['file_name', 'full_path']:
+            if key in match.meta:
+                passed = False         
                 negate = False
-                if search.startswith('!'):
-                    search = search[1:]
+                value = match.meta[key].lower()
+                if value.startswith('!'):
+                    value = value[1:]
                     negate = True
-                if 'sub:' in search:
-                    ns = search.replace('sub:', '')
-                    if ns in fname.lower() and not negate or (not ns in fname.lower() and negate):
-                        passed = True
-                else:
-                    if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
-                        passed = True
-            if not passed:
-                #print(f'meta filtered {fname} on {key}')
-                return True
+                for search in value.split(','):
+                    if key == 'file_name':
+                        fname = os.path.basename(fname)
+                    if 'sub:' in search:
+                        ns = search.replace('sub:', '')
+                        if ns in fname.lower():
+                            #print(f'{ns} in {fname}')
+                            passed = True
+                    else:
+                        if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
+                            passed = True
 
-    if 'file_ext' in match.meta:
-        passed = False
-        for search in match.meta['file_ext'].lower().split(','):
+                if (not passed and not negate) or (passed and negate):
+                    return True 
+                """
+                if not passed:
+                    if negate:
+                        return False
+                    else:
+                        return True
+                """
+
+        if 'file_ext' in match.meta:
+            passed = False
             negate = False
-            if search.startswith('!'):
-                search = search[1:]
+            value = match.meta['file_ext'].lower()
+            if value.startswith('!'):
+                value = value[1:]
                 negate = True
-            if fname.lower().endswith(search) and not negate or (not fname.lower().endswith(search) and negate):
-                passed = True
-        if not passed:
-            #print(f'meta filtered {fname} on file_ext')
-            return True
+            for search in value.split(','):
+                if fname.lower().endswith(search):
+                    passed = True
+            if (not passed and not negate) or (passed and negate):
+                return True 
+            
+        return False
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         
-    return False
 
 
 
