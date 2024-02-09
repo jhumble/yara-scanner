@@ -179,6 +179,8 @@ def filter_match(match, fname):
         if key in match.meta:
             passed = False         
             for search in match.meta[key].lower().split(','):
+                if key == 'file_name':
+                    fname = os.path.basename(fname)
                 negate = False
                 if search.startswith('!'):
                     search = search[1:]
@@ -188,7 +190,7 @@ def filter_match(match, fname):
                     if ns in fname.lower() and not negate or (not ns in fname.lower() and negate):
                         passed = True
                 else:
-                    if search == fname.lower() and not negate or (search != fname.lower() and negate):
+                    if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
                         passed = True
             if not passed:
                 #print(f'meta filtered {fname} on {key}')

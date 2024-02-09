@@ -4,7 +4,7 @@ import binascii
 import sys
 sys.setrecursionlimit(50000)
 
-def recursive_all_files(directory, ext_filter=None):
+def recursive_all_files(directory, ext_filter=None, dir_filter=['.git']):
     all_files = []
     dir_content = []
     ret = []
@@ -12,6 +12,9 @@ def recursive_all_files(directory, ext_filter=None):
     if os.path.isfile(directory):
         dir_content = [directory]
     else:
+        for df in dir_filter:
+            if df.lower() in directory:
+                return []
         if '*' in directory:
             dir_content = glob.glob(directory)
         else:
