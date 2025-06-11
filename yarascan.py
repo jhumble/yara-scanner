@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.13
 import os
-import yara
+import yara_x as yara
 import sys
 import datetime
 import re
@@ -109,8 +109,8 @@ def highest_impact(match):
     highest = 0
     for entry in match:
         #print entry
-        if entry.meta:
-            highest = min(100, max(0, entry.meta.get('impact', 100), highest))
+        if entry.metadata:
+            highest = min(100, max(0, entry.metadata.get('impact', 100), highest))
         else:
             highest = 100
     return highest
@@ -122,8 +122,14 @@ def worker():
     global files_scanned
     global match_count
     global lock
+    if not options.profile:
+        scanner = yara.Scanner(compiled_rules)
+    else:
+        for rule in compiled_rules.values():
+            scanner = yara.Scanner(rule['rule'])
+            rule['scanner'] = scanner
 
-    yara.set_config(max_match_data=4096)
+    #yara.set_config(max_match_data=4096)
     #print 'worker %s started' % (current_thread())
     while True: #not scan_queue.empty():
         if TERMINATE_EARLY:
@@ -137,24 +143,29 @@ def worker():
             return
         try:
             if not options.profile:
-                matches = compiled_rules.match(job['fname'])
+                with open(job['fname'], 'rb') as fp:
+                    raw = fp.read()
+                    scan_result = compiled_rules.scan(raw)
+                    #scan_result = scanner.scan(raw)
             else:
                 matches = []
                 for key, rule in compiled_rules.items():
                     start = time()
-                    matches += rule['rule'].match(job['fname'])
+                    scan_result += rule['scanner'].scan_file(job['fname'])
                     profile_queue.put({'fname': job['fname'], 'rulefile': rule['rulefile'], 'time': time() - start})
             # filter out any matches that do not apply
-            matches = [match for match in matches if not filter_match(match, job['fname'])]
-            result_queue.put({'matches': matches, 'fname': job['fname']})
+            filtered_matches = filter_scan_result(scan_result, job['fname'])
+
+            result_queue.put({'scan_result': scan_result, 'fname': job['fname']})
             lock.acquire()
-            if matches:
+            if filtered_matches:
                 match_count += 1
             bytes_scanned += job['size']
             files_scanned += 1
             lock.release()
         except Exception as e:
-            print('Exception scanning %s (%s): %s' % (job['fname'],human_size(job['size']),e))
+            import traceback
+            print('Exception scanning %s (%s): %s\n%s' % (job['fname'],human_size(job['size']),e,traceback.format_exc()))
             pass
         scan_queue.task_done()
     #print 'worker %s exiting' % (current_thread())
@@ -174,58 +185,71 @@ def human_size(nbytes):
     f = ('%s' % float('%.3g' % nbytes)).rstrip('0').rstrip('.')
     return '%s %s' % (f, suffixes[i])
 
-def filter_match(match, fname):
-    try:
-        for key in ['file_name', 'full_path']:
-            if key in match.meta:
-                passed = False         
+def filter_scan_result(scan_result: object, fname: str) -> object:
+    """
+        Return a ScanResults object with .matching_rules filtered via metadata        
+    """
+    filtered_matches = []
+    for match in scan_result.matching_rules: 
+        try:
+            for key in ['file_name', 'full_path']:
+                metadata = {}
+                # For some reason yara-x arbitrarily seems to store some metadata keys/values as bytes and some as strings. Try to normalize
+                for k,v in match.metadata:
+                    try:
+                        if isinstance(v, (bytes, bytearray)):
+                            v = v.decode()
+                        if isinstance(k, (bytes, bytearray)):
+                            k = k.decode()
+                        metadata[k] = v
+                    except Exception as e:
+                        print(e)
+                        input()
+                        metadata[k] = v
+                if key in metadata:
+                    passed = False         
+                    negate = False
+                    value = metadata[key].lower()
+                    if value.startswith('!'):
+                        value = value[1:]
+                        negate = True
+                    for search in value.split(','):
+                        if key == 'file_name':
+                            fname = os.path.basename(fname)
+                        if 'sub:' in search:
+                            ns = search.replace('sub:', '')
+                            if ns in fname.lower():
+                                #print(f'{ns} in {fname}')
+                                passed = True
+                        else:
+                            if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
+                                passed = True
+
+                    if (not passed and not negate) or (passed and negate):
+                        filtered_matches.append(match)
+                        continue
+
+            if 'file_ext' in metadata:
+                passed = False
                 negate = False
-                value = match.meta[key].lower()
+                value = metadata['file_ext'].lower()
                 if value.startswith('!'):
                     value = value[1:]
                     negate = True
                 for search in value.split(','):
-                    if key == 'file_name':
-                        fname = os.path.basename(fname)
-                    if 'sub:' in search:
-                        ns = search.replace('sub:', '')
-                        if ns in fname.lower():
-                            #print(f'{ns} in {fname}')
-                            passed = True
-                    else:
-                        if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
-                            passed = True
-
+                    if fname.lower().endswith(search):
+                        passed = True
                 if (not passed and not negate) or (passed and negate):
-                    return True 
-                """
-                if not passed:
-                    if negate:
-                        return False
-                    else:
-                        return True
-                """
+                    filtered_matches.append(match)
+                    continue
+                
+            return None
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
 
-        if 'file_ext' in match.meta:
-            passed = False
-            negate = False
-            value = match.meta['file_ext'].lower()
-            if value.startswith('!'):
-                value = value[1:]
-                negate = True
-            for search in value.split(','):
-                if fname.lower().endswith(search):
-                    passed = True
-            if (not passed and not negate) or (passed and negate):
-                return True 
-            
-        return False
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        return filtered_matches
         
-
-
 
 def monitor_thread(worker_threads):
     start = time()
@@ -263,16 +287,28 @@ def monitor_thread(worker_threads):
 
 def compile_rule(rulefile, include_compiled=False):
     try:
+        compiler = yara.Compiler()
         key = os.path.splitext(os.path.split(rulefile)[1])[0]
         start = time()
-        rule = yara.compile(filepaths={key: rulefile},externals={'path': "TEMPORARY_EXT_VAR_VALUE", 'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
+        with open(rulefile, 'r') as fp:
+            src = fp.read()
+        compiler.add_source(origin=key, src=src) 
         rtn = {'key': key, 'rulefile': rulefile, 'compile_time': time() - start}
+        compiled = compiler.build()
         if include_compiled:
-            rtn['rule'] = rule
+            rtn['rule'] = compiled
         return rtn
     except Exception as e:
         print('rule %s failed to compile! Error: %s' % (rulefile, e))
     return None
+
+def profiled_compile(file_list):
+    rtn = {}
+    for f in file_list:
+        compiled = compile_rule(f, include_compiled=True)
+        if compiled:
+            rtn[compiled['key']] = compiled
+    return rtn
     
 def test_compile(file_list, individual_rules=False):
     rtn = {}
@@ -294,34 +330,38 @@ def test_compile(file_list, individual_rules=False):
 def build_rules(signature_dir, profile_rules=False):
     file_list = recursive_all_files(signature_dir,'yar')
     _hash = rules_hash(file_list)
+
     if profile_rules:
-        return test_compile(file_list, individual_rules=True)
-    path = os.path.join('/tmp/', '%s.py3.cyar' % (_hash))
-    if os.path.isfile(path):
-        print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
-        return yara.load(path)
+        return profiled_compile(file_list)
+
+    compiled_rules_path = os.path.join('/tmp/', '%s.py3.cxyar' % (_hash))
+    if os.path.isfile(compiled_rules_path):
+        print('[*]\tUp to date compiled rules already exist at %s. Using those' % (compiled_rules_path))
+        return yara.Rules.deserialize_from(open(compiled_rules_path, 'rb'))
 
     start = time()
-    rulefile_paths = test_compile(file_list)
+    compiler = yara.Compiler()
+    for path in file_list:
+        try:
+            with open(path, 'r') as fp:
+                src = fp.read()
+            compiler.new_namespace(os.path.basename(path))
+            compiler.add_source(origin=os.path.basename(path), src=src) 
+        except Exception as e:
+            print(f'Exception compiling rule {path}: {e}')
+    compiled_rules = compiler.build()
     elapsed = time() - start
-    if options.performance:
-        print('[*]\tTest compiled %s rules in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
-
-    start = time()
+    
     try:
-        compiled_rules = yara.compile(filepaths=rulefile_paths,externals={'path': "TEMPORARY_EXT_VAR_VALUE", 'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
-    except Exception as e:
-        print('Exception compiling rules: %s' % (e))
-    elapsed = time() - start
-    try:
-        compiled_rules.save(path)
+        with open(compiled_rules_path, 'wb') as fp:
+            compiled_rules.serialize_into(fp)
         os.chmod(path, 0o666)
     except Exception as e:
-        print('[!]\tFailed to save compiled rules %s: %s' % (path,e))
-    compiled_size = os.stat(path).st_size
+        print('[!]\tFailed to save compiled rules %s: %s' % (compiled_rules_path,e))
+    compiled_size = os.stat(compiled_rules_path).st_size
 
     if options.performance:
-        print('[*]\tCompiled %s rules in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
+        print('[*]\tCompiled %s rules in %s seconds.' % (len(file_list), round(elapsed,2)))
         print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
     return compiled_rules
 
@@ -381,7 +421,7 @@ def hexlify(string):
 def score_matches(matches):
     score = 0
     for match in matches:
-        score = max(score, int(match.meta.get('impact', 0)))
+        score = max(score, int(match.metadata.get('impact', 0)))
     return score
 
 def disassemble(fname, bytedict, prefer='32', context=5):
@@ -529,11 +569,11 @@ def prefilter(cache_dir, rule_path):
         strings = rule.strings
         print('Extracting trigrams from {}'.format([string['value'].rstrip('"').lstrip('"') for string in strings]))
         #supported
-    elif 'cache_helper' in rule.metas:
-        print(('Applying cache helper {}'.format(rule.metas['cache_helper'])))
+    elif 'cache_helper' in rule.metadatas:
+        print(('Applying cache helper {}'.format(rule.metadatas['cache_helper'])))
         strings = []
-        print('Extracting trigrams from {}'.format(rule.metas['cache_helper'].split(',')))
-        for search in rule.metas['cache_helper'].split(','):
+        print('Extracting trigrams from {}'.format(rule.metadatas['cache_helper'].split(',')))
+        for search in rule.metadatas['cache_helper'].split(','):
             strings.append({'type': 'string', 'value': search})
     else:
         print('Can only cache accelerate "any of them" rules or those with cache_helper meta')
@@ -578,7 +618,15 @@ def prefilter(cache_dir, rule_path):
     return [id_to_path[str(fid)] for fid in matching]
 
 # handle backward incompatible change introduced in v.4.3.0: https://github.com/VirusTotal/yara-python/releases/tag/v4.3.0
-def iterate_matches(matches):
+def iterate_matches(path, matches):
+    # yara-x
+    with open(path, 'rb') as fp:
+        for pattern in matches.patterns:
+            for match in pattern.matches:
+                fp.seek(match.offset)
+                data = fp.read(match.length)
+                yield match.offset, pattern.identifier, data
+    """
     #pre v4.3.0
     for matchobj in matches:
         if type(matchobj) is tuple:
@@ -589,6 +637,7 @@ def iterate_matches(matches):
             name = matchobj.identifier
             for string in matchobj.instances:
                 yield string.offset, name, string.matched_data
+    """
 
 
 if __name__ == '__main__':
@@ -643,7 +692,7 @@ if __name__ == '__main__':
         print('built profiled rules')
     else:
         try:
-            compiled_rules = yara.load(options.signatures)
+            compiled_rules = yara.Rules.deserialize_from(options.signatures)
         except Exception as e:
             compiled_rules = build_rules(options.signatures)
 
@@ -697,8 +746,8 @@ if __name__ == '__main__':
         while not result_queue.empty():
             res = result_queue.get()
             matches = {}
-            for match in res['matches']:
-                matches[match.rule] = match.meta
+            for match in res['scan_result']:
+                matches[match.rule] = match.metadata
             if matches:
                 results[res['fname']] = matches
         with open(options.json, 'w') as fp:
@@ -706,62 +755,65 @@ if __name__ == '__main__':
     else:
         while not result_queue.empty():
             res = result_queue.get()
-            if not res['matches'] and not options.negative:
-                continue
+            scan_result = res['scan_result']
+
             header = False
 
-            for matchobj in res['matches']:
-                if not filter_match(matchobj, res['fname']):
-                    if not header:
-                        print(res['fname'])# + '\t' + str(score_matches(res['matches'])))
-                        header = True
-                    if options.categorize_dir:
-                        d = os.path.join(options.categorize_dir, matchobj.rule)
-                        os.makedirs(d, exist_ok=True)
-                        shutil.copy(res['fname'], d) 
-                    strings = {}
-                    if options.strings:
-                        for offset, name, data in iterate_matches(matchobj.strings):
-                            raw_bytes, printable, wide, string = format_string_output(string=data, offset=offset, fname=res['fname'], context=options.context, line=options.line)
-                            string = string.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                            if name not in strings:
-                                strings[name] = {}
-                            if string not in strings[name]:
-                                if wide:
-                                    strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': True}
-                                else:
-                                    strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': False}
-                            if offset not in strings[name][string]['offsets']:
-                                strings[name][string]['offsets'].append(offset)
+            filtered_matches = filter_scan_result(scan_result, res['fname'])
+            if not filtered_matches and not options.negative:
+                continue
+
+            for matches in filtered_matches:
+                if not header:
+                    print(res['fname'])# + '\t' + str(score_matches(res['scan_result'])))
+                    header = True
+                if options.categorize_dir:
+                    d = os.path.join(options.categorize_dir, res['scan_result'].identifier)
+                    os.makedirs(d, exist_ok=True)
+                    shutil.copy(res['fname'], d) 
+                strings = {}
+                if options.strings:
+                    for offset, name, data in iterate_matches(res['fname'], matches):
+                        raw_bytes, printable, wide, string = format_string_output(string=data, offset=offset, fname=res['fname'], context=options.context, line=options.line)
+                        string = string.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                        if name not in strings:
+                            strings[name] = {}
+                        if string not in strings[name]:
+                            if wide:
+                                strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': True}
+                            else:
+                                strings[name][string] = {'bytes': raw_bytes, 'offsets': [], 'printable': printable, 'wide': False}
+                        if offset not in strings[name][string]['offsets']:
+                            strings[name][string]['offsets'].append(offset)
+                
+                print('    %s/%s' % (matches.namespace, matches.identifier))
                     
-                    print('    %s/%s' % (matchobj.namespace, matchobj.rule))
-                        
-                    if options.strings:
-                        for name, string_dict in strings.items():
-                            for string in list(string_dict.keys())[:options.max_strings]:
-                                offsets = string_dict[string]['offsets']
-                                for offset in offsets[:options.max_offsets]:
-                                    if string_dict[string]['wide'] and options.wide:
-                                        string = string + bcolors.OKBLUE + ' utf-16le' + bcolors.ENDC
-                                    if options.offset: 
-                                        try:
-                                            print('        %s:0x%x:    %s' % (name, offset, string))
-                                        except Exception as e:
-                                            print('error: %s' % (e))
-                                    else:
-                                        try:
-                                            print('        %s' % (string))
-                                            continue
-                                        except Exception as e:
-                                            print('error: %s' % (e))
-                                    if options.disassemble and string_dict[string]['printable']:
-                                        try:
-                                            dis = disassemble(res['fname'], string_dict[string]['bytes'], options.disassemble, context=options.context)
-                                            print(' '*12 + dis.replace('\n', '\n' + ' '*12))
-                                        except Exception as e:
-                                            print('Failed to disassemble %s: %s' % (string_dict[string]['bytes'], e))
-                                            import traceback
-                                            print(traceback.format_exc())
+                if options.strings:
+                    for name, string_dict in strings.items():
+                        for string in list(string_dict.keys())[:options.max_strings]:
+                            offsets = string_dict[string]['offsets']
+                            for offset in offsets[:options.max_offsets]:
+                                if string_dict[string]['wide'] and options.wide:
+                                    string = string + bcolors.OKBLUE + ' utf-16le' + bcolors.ENDC
+                                if options.offset: 
+                                    try:
+                                        print('        %s:0x%x:    %s' % (name, offset, string))
+                                    except Exception as e:
+                                        print('error: %s' % (e))
+                                else:
+                                    try:
+                                        print('        %s' % (string))
+                                        continue
+                                    except Exception as e:
+                                        print('error: %s' % (e))
+                                if options.disassemble and string_dict[string]['printable']:
+                                    try:
+                                        dis = disassemble(res['fname'], string_dict[string]['bytes'], options.disassemble, context=options.context)
+                                        print(' '*12 + dis.replace('\n', '\n' + ' '*12))
+                                    except Exception as e:
+                                        print('Failed to disassemble %s: %s' % (string_dict[string]['bytes'], e))
+                                        import traceback
+                                        print(traceback.format_exc())
                     print()
     
     if options.profile:
