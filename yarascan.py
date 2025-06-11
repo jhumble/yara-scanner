@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 import os
 import yara
 import sys
@@ -25,7 +25,7 @@ from pprint import pprint
 usage = "yarascan.py [-S SIGNATURES_DIR] [-t] [FILE_OR_DIR]..." 
 opt_parser = OptionParser(usage=usage)
 opt_parser.add_option("-S", "--signatures", action="store",dest="signatures",
-    default='/Users/jhumble/ice-53-yara-rules/', help="compiled signatures or directory to load YARA rules from")
+    default='/home/jhumble/RE/ice-53-yara-rules/', help="compiled signatures or directory to load YARA rules from")
 opt_parser.add_option("-T", "--Threshold", action="store",dest="threshold",default=3.0,type=float,
    help="threshold used in profiling to determine if a rule's runtime is abnormal. Default=3, which returns any rules taking 3x longer than average or 1/3x or less of average")
 opt_parser.add_option("-p", "--performance", action="store_true",dest="performance",
