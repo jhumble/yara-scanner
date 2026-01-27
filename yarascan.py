@@ -321,7 +321,7 @@ def build_rules(signature_dir, profile_rules=False):
     compiled_size = os.stat(path).st_size
 
     if options.performance:
-        print('[*]\tCompiled %s rules in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
+        print('[*]\tCompiled %s rule files in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
         print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
     return compiled_rules
 
