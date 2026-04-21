@@ -24,8 +24,8 @@ from pprint import pprint
 
 usage = "yarascan.py [-S SIGNATURES_DIR] [-t] [FILE_OR_DIR]..." 
 opt_parser = OptionParser(usage=usage)
-opt_parser.add_option("-S", "--signatures", action="store",dest="signatures",
-    default='/home/jhumble/RE/ice-53-yara-rules/', help="compiled signatures or directory to load YARA rules from")
+opt_parser.add_option("-S", "--signatures", action="append",dest="signatures",
+    default=None, help="compiled .cyar file, .yar file, or directory of YARA rules. Repeat -S to combine multiple sources.")
 opt_parser.add_option("-T", "--Threshold", action="store",dest="threshold",default=3.0,type=float,
    help="threshold used in profiling to determine if a rule's runtime is abnormal. Default=3, which returns any rules taking 3x longer than average or 1/3x or less of average")
 opt_parser.add_option("-p", "--performance", action="store_true",dest="performance",
@@ -58,6 +58,9 @@ opt_parser.add_option('-d', "--disassemble", action="store", choices=['64', '32'
     help="Disassemble matching bytes using 32/64 bit mode as provided")
 
 (options, args) = opt_parser.parse_args()
+options.user_provided_signatures = options.signatures is not None
+if not options.signatures:
+    options.signatures = ['/home/jhumble/RE/ice-53-yara-rules/']
 printable = re.compile(rb'^[\x20-\x7e\x0a]*$')
 printable_wide = re.compile(rb'^([\x20-\x7e]\x00)*$')
 
@@ -291,8 +294,27 @@ def test_compile(file_list, individual_rules=False):
                 rtn[item['key']] = item['rulefile']
     return rtn
        
-def build_rules(signature_dir, profile_rules=False):
-    file_list = recursive_all_files(signature_dir,'yar')
+def collect_rule_files(signatures):
+    """Expand a list of dirs / .yar paths into a deduped list of rule files."""
+    files, seen = [], set()
+    for sig in signatures:
+        if os.path.isdir(sig):
+            candidates = recursive_all_files(sig, 'yar')
+        elif os.path.isfile(sig):
+            candidates = [sig]
+        else:
+            if options.user_provided_signatures:
+                print('[!]\tSignature path does not exist: %s' % (sig))
+            continue
+        for f in candidates:
+            real = os.path.realpath(f)
+            if real not in seen:
+                seen.add(real)
+                files.append(f)
+    return files
+
+def build_rules(signatures, profile_rules=False):
+    file_list = collect_rule_files(signatures)
     _hash = rules_hash(file_list)
     if profile_rules:
         return test_compile(file_list, individual_rules=True)
@@ -620,12 +642,14 @@ if __name__ == '__main__':
         print('[*]\tScanning with %s threads.' % (options.num_threads))
 
     scanlist = []
+    # Trigram prefilter only applies when exactly one precompiled rule file is supplied.
+    single_sig = options.signatures[0] if len(options.signatures) == 1 and os.path.isfile(options.signatures[0]) else None
     for arg in args:
         #Perform prefiltering if we're operating with a single yara rule and are targetting a cache dir
-        if os.path.exists(os.path.join(arg, 'cache_files.json')) and os.path.isfile(options.signatures):
+        if single_sig and os.path.exists(os.path.join(arg, 'cache_files.json')):
             print('Prefiltering with trigram cache')
-            scanlist += prefilter(arg, options.signatures)
-        else:    
+            scanlist += prefilter(arg, single_sig)
+        else:
             scanlist += recursive_all_files(arg)
 
 
@@ -641,11 +665,14 @@ if __name__ == '__main__':
     if options.profile:
         compiled_rules = build_rules(options.signatures, True)
         print('built profiled rules')
-    else:
+    elif len(options.signatures) == 1 and os.path.isfile(options.signatures[0]):
+        # Single precompiled .cyar fast path
         try:
-            compiled_rules = yara.load(options.signatures)
+            compiled_rules = yara.load(options.signatures[0])
         except Exception as e:
             compiled_rules = build_rules(options.signatures)
+    else:
+        compiled_rules = build_rules(options.signatures)
 
     start = time()
     complete = 0
