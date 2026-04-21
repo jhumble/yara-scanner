@@ -22,10 +22,10 @@ from pprint import pprint
 
 
 
-usage = "yarascan.py [-S SIGNATURES_DIR] [-t] [FILE_OR_DIR]..." 
+usage = "yarascan.py [-S SIG[::RULE[,RULE...]]] [-t] [FILE_OR_DIR]..."
 opt_parser = OptionParser(usage=usage)
 opt_parser.add_option("-S", "--signatures", action="append",dest="signatures",
-    default=None, help="compiled .cyar file, .yar file, or directory of YARA rules. Repeat -S to combine multiple sources.")
+    default=None, help="compiled .cyar file, .yar file, or directory of YARA rules. Append '::rule_name' (optionally comma-separated) to restrict scanning to those rules from that source. Repeat -S to combine multiple sources.")
 opt_parser.add_option("-T", "--Threshold", action="store",dest="threshold",default=3.0,type=float,
    help="threshold used in profiling to determine if a rule's runtime is abnormal. Default=3, which returns any rules taking 3x longer than average or 1/3x or less of average")
 opt_parser.add_option("-p", "--performance", action="store_true",dest="performance",
@@ -61,6 +61,21 @@ opt_parser.add_option('-d', "--disassemble", action="store", choices=['64', '32'
 options.user_provided_signatures = options.signatures is not None
 if not options.signatures:
     options.signatures = ['/home/jhumble/RE/ice-53-yara-rules/']
+
+# Parse optional '::rule1,rule2' suffix per -S to restrict which rules fire from that source.
+options.parsed_signatures = []
+for raw in options.signatures:
+    if '::' in raw:
+        path, rules_str = raw.rsplit('::', 1)
+        names = set(r.strip() for r in rules_str.split(',') if r.strip())
+    else:
+        path, names = raw, None
+    options.parsed_signatures.append((path, names))
+options.signatures = [p for p, _ in options.parsed_signatures]
+
+# Populated by collect_rule_files / main. Maps rulefile namespace -> set of allowed rule names.
+# Special key '*' means restrict regardless of namespace (used for .cyar fast-path).
+rule_filter = {}
 printable = re.compile(rb'^[\x20-\x7e\x0a]*$')
 printable_wide = re.compile(rb'^([\x20-\x7e]\x00)*$')
 
@@ -179,6 +194,13 @@ def human_size(nbytes):
 
 def filter_match(match, fname):
     try:
+        # Per-source rule filter from '-S path::rule_name[,rule_name...]'.
+        if rule_filter:
+            allowed = rule_filter.get('*')
+            if allowed is None:
+                allowed = rule_filter.get(match.namespace)
+            if allowed is not None and match.rule not in allowed:
+                return True
         for key in ['file_name', 'full_path']:
             if key in match.meta:
                 passed = False         
@@ -294,10 +316,19 @@ def test_compile(file_list, individual_rules=False):
                 rtn[item['key']] = item['rulefile']
     return rtn
        
-def collect_rule_files(signatures):
-    """Expand a list of dirs / .yar paths into a deduped list of rule files."""
+def collect_rule_files(parsed_signatures):
+    """Expand parsed -S entries into (file_list, rule_filter).
+
+    parsed_signatures: iterable of (path, rule_names_or_None).
+    Returns (files, rule_filter) where rule_filter maps namespace (rulefile
+    basename without .yar) -> set of allowed rule names. Namespaces absent
+    from the map are unrestricted. A namespace that appears once without a
+    filter overrides any restrictions added for the same namespace elsewhere.
+    """
     files, seen = [], set()
-    for sig in signatures:
+    restricted = {}
+    unrestricted = set()
+    for sig, rule_names in parsed_signatures:
         if os.path.isdir(sig):
             candidates = recursive_all_files(sig, 'yar')
         elif os.path.isfile(sig):
@@ -311,10 +342,17 @@ def collect_rule_files(signatures):
             if real not in seen:
                 seen.add(real)
                 files.append(f)
-    return files
+            ns = os.path.splitext(os.path.basename(f))[0]
+            if rule_names is None:
+                unrestricted.add(ns)
+            else:
+                restricted.setdefault(ns, set()).update(rule_names)
+    rf = {ns: names for ns, names in restricted.items() if ns not in unrestricted}
+    return files, rf
 
-def build_rules(signatures, profile_rules=False):
-    file_list = collect_rule_files(signatures)
+def build_rules(parsed_signatures, profile_rules=False):
+    global rule_filter
+    file_list, rule_filter = collect_rule_files(parsed_signatures)
     _hash = rules_hash(file_list)
     if profile_rules:
         return test_compile(file_list, individual_rules=True)
@@ -663,16 +701,19 @@ if __name__ == '__main__':
     scan_files = scan_queue.qsize()
 
     if options.profile:
-        compiled_rules = build_rules(options.signatures, True)
+        compiled_rules = build_rules(options.parsed_signatures, True)
         print('built profiled rules')
-    elif len(options.signatures) == 1 and os.path.isfile(options.signatures[0]):
+    elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]):
         # Single precompiled .cyar fast path
+        path, names = options.parsed_signatures[0]
         try:
-            compiled_rules = yara.load(options.signatures[0])
+            compiled_rules = yara.load(path)
+            if names:
+                rule_filter = {'*': names}
         except Exception as e:
-            compiled_rules = build_rules(options.signatures)
+            compiled_rules = build_rules(options.parsed_signatures)
     else:
-        compiled_rules = build_rules(options.signatures)
+        compiled_rules = build_rules(options.parsed_signatures)
 
     start = time()
     complete = 0
