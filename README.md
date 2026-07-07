@@ -11,9 +11,9 @@ Roughly, compared to `yara`:
 | | `yara` | `yarascan.py` |
 |---|---|---|
 | Parallel scanning | `-p` threads, but no progress | threaded by default, live progress + ETA + match count |
-| Combining rule sources | one `-r` at a time | `-S` repeatable, mixes `.yar` files / dirs / precompiled `.cyar` |
+| Combining rule sources | one `-r` at a time | `-S` repeatable, mixes `.yar` files / dirs / precompiled `.yxc` |
 | Run a specific rule from a multi-rule file | no | `-S foo.yar::rule_b` (comma-separate for several) |
-| Compiled rule caching | manual | automatic — compiles once to `/tmp/<hash>.py3.cyar`, reused until a rule mtime changes |
+| Compiled rule caching | manual | automatic — compiles once to `/tmp/<content-hash>.yxc`, reused as long as no rule-source bytes changed |
 | Per-rule performance profiling | no | `-P` — flags rules running N× slower/faster than average |
 | Match context in output | `-s` shows bytes, no context, no color | `-s -c N` shows match bytes in red with N bytes of surrounding context; `-l` expands to the full line |
 | Wide / UTF-16LE matches | shown raw | auto-decoded, optional tag with `-w` |
@@ -29,7 +29,7 @@ Roughly, compared to `yara`:
 ## Install
 
 ```
-pip install yara-python simplejson
+pip install yara-x
 # optional: r2pipe  (needed for -d / disassembly)
 ```
 
@@ -41,7 +41,7 @@ Python 3.13. Drop the repo anywhere and either symlink `yarascan.py` onto your `
 yarascan.py [-S SIG[::RULE[,RULE...]]] [options] FILE_OR_DIR...
 ```
 
-`-S` is repeatable and accepts a `.yar` file, a directory of rules, or a precompiled `.cyar`. Positional arguments are scan targets (files or dirs, recursively walked). If `-S` is omitted, a hardcoded default rules dir is used.
+`-S` is repeatable and accepts a `.yar` file, a directory of rules, or a precompiled `.yxc`. Positional arguments are scan targets (files or dirs, recursively walked). If `-S` is omitted, a hardcoded default rules dir is used.
 
 ### Quickstart
 
@@ -50,7 +50,7 @@ $ yarascan.py -S yara-rules/Classification_AsyncRat.yar \
               -S yara-rules/Classification_njRAT.yar \
               ~/RE/samples/malpedia/win.asyncrat/ \
               ~/RE/samples/malpedia/win.njrat/
-[*]     Up to date compiled rules already exist at /tmp/13f8705c0ccdc43d428c834590176e63.py3.cyar. Using those
+[*]     Up to date compiled rules already exist at /tmp/13f8705c0ccdc43d428c834590176e63.yxc. Using those
 ~/RE/samples/malpedia/win.asyncrat/4541b53...a94f899_unpacked
     Classification_AsyncRat/Classification_AsyncRAT
 
@@ -143,7 +143,7 @@ The "cost" is the engine's own per-rule cost counter (`atom_matches × match_tim
 
 The "top 5 files by total cost" block below the rule outliers points at which input file made the corpus expensive — a useful pivot when one slow rule's cost is concentrated on a single artifact.
 
-**Setup required.** `-P` shells out to a separately-built `yara` CLI compiled with `--enable-profiling` (because yara-python's `profiling_info()` is broken against current libyara — see issue [VirusTotal/yara-python#155](https://github.com/VirusTotal/yara-python/issues/155)). The path is hardcoded to `~/tools/yara-scanner/yara-profiling/bin/yara`; build it with:
+**Setup required.** `-P` shells out to a separately-built `yara` CLI compiled with `--enable-profiling`. Source rule files are passed as `[namespace:]path` positional args — the compiled-rules binary format is not portable between yara-x's `Rules` and the standalone `yara` CLI's `.cyar`. The path is hardcoded to `~/tools/yara-scanner/yara-profiling/bin/yara`; build it with:
 
 ```
 git clone https://github.com/VirusTotal/yara.git ~/tools/build-yara/yara
@@ -154,7 +154,7 @@ make -j$(nproc)
 make install
 ```
 
-This is a separate install from your system `yara` — it lives under `~/tools/yara-scanner/yara-profiling/` and is only invoked when you pass `-P`. Your normal yarascan runs use the system libyara (no profiling overhead).
+This is a separate install from your system `yara` — it lives under `~/tools/yara-scanner/yara-profiling/` and is only invoked when you pass `-P`. Your normal yarascan runs use yara-x (no profiling overhead).
 
 If the profiled binary is missing, `yarascan -P` warns and exits cleanly with build instructions; no other modes are affected.
 

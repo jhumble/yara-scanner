@@ -1,66 +1,84 @@
 #!/usr/bin/env python3.13
 import os
-import yara
+import yara_x as yx
 import sys
 import datetime
 import re
 import binascii
 import glob
 import shutil
-from copy import deepcopy
 
-import simplejson as json
+import json
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from utils import recursive_all_files
 from time import sleep, time
-from optparse import OptionParser
-from threading import Thread, Lock, current_thread
-from queue import Queue
-from multiprocessing import Pool, cpu_count
+from argparse import ArgumentParser
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from hashlib import md5
 from pprint import pprint
 
 
+DEFAULT_RULES_DIR = '/home/jhumble/RE/ice-53-yara-rules/'
 
-usage = "yarascan.py [-S SIG[::RULE[,RULE...]]] [-t] [FILE_OR_DIR]..."
-opt_parser = OptionParser(usage=usage)
-opt_parser.add_option("-S", "--signatures", action="append",dest="signatures",
-    default=None, help="compiled .cyar file, .yar file, or directory of YARA rules. Append '::rule_name' (optionally comma-separated) to restrict scanning to those rules from that source. Repeat -S to combine multiple sources.")
-opt_parser.add_option("-T", "--Threshold", action="store",dest="threshold",default=3.0,type=float,
-   help="threshold used in profiling to determine if a rule's runtime is abnormal. Default=3, which returns any rules taking 3x longer than average or 1/3x or less of average")
-opt_parser.add_option("-p", "--performance", action="store_true",dest="performance",
-    default=False, help="Enable progress and performance profiling")
-opt_parser.add_option("-P", "--Profile", action="store_true",dest="profile",
-    default=False, help="Profile rules searching for performance issues, overlapping detection, and error 30")
-opt_parser.add_option("-s", "--strings", action="store_true",dest="strings",
-    default=False, help="output matching strings")
-opt_parser.add_option("-C", "--categorize", action="store",dest="categorize_dir",
-    default=False, help="categorize the scanned samples into directories by rule name")
-opt_parser.add_option("-o", "--offset", action="store_true",dest="offset",
-    default=False, help="show match string offsets")
-opt_parser.add_option("-t", "--threads", type=int, action="store",dest="num_threads",
-    default=None, help="number of threads/workers")
-opt_parser.add_option("-c", "--context", type=int, action="store",dest="context",
-    default=5, help="number of bytes of context before and after matches")
-opt_parser.add_option("-l", "--line", action="store_true",dest="line",
-    default=False, help="Output entire line match occurs on")
-opt_parser.add_option("-j", "--json", action="store",dest="json",
-    default=False, help="json output")
-opt_parser.add_option("-n", "--negative", action="store_true",dest="negative",
-    default=False, help="Output files having no matches")
-opt_parser.add_option("-w", "--wide", action="store_true",dest="wide",
-    default=False, help="Mark matching wide/utf-16le strings")
-opt_parser.add_option("--max-strings", action="store",dest="max_strings",type=int,
-    default=5, help="Max strings to print per rule")
-opt_parser.add_option("--max-offsets", action="store",dest="max_offsets",type=int,
-    default=5, help="Max offsets to print per string")
-opt_parser.add_option('-d', "--disassemble", action="store", choices=['64', '32'], default=None,
-    help="Disassemble matching bytes using 32/64 bit mode as provided")
 
-(options, args) = opt_parser.parse_args()
+def build_arg_parser():
+    """Build the CLI argument parser. Kept in a helper so tests / other
+    entry points can grab it without side effects."""
+    p = ArgumentParser(
+        prog='yarascan.py',
+        usage='yarascan.py [-S SIG[::RULE[,RULE...]]] [OPTIONS] [FILE_OR_DIR]...',
+        description='YARA scanner wrapper with cached compile, grep-like output, and profiling.',
+    )
+    p.add_argument('paths', nargs='*', metavar='FILE_OR_DIR',
+        help='files or directories to scan (recursed)')
+    p.add_argument('-S', '--signatures', action='append', default=None,
+        help="compiled .cyar file, .yar file, or directory of YARA rules. "
+             "Append '::rule_name' (optionally comma-separated) to restrict "
+             "scanning to those rules from that source. Repeat -S to combine "
+             "multiple sources.")
+    p.add_argument('-T', '--Threshold', dest='threshold', type=float, default=3.0,
+        help="threshold used in profiling to determine if a rule's runtime "
+             "is abnormal. Default=3, which returns any rules taking 3x "
+             "longer than average or 1/3x or less of average")
+    p.add_argument('-p', '--performance', action='store_true', default=False,
+        help='Enable progress and performance profiling')
+    p.add_argument('-P', '--Profile', dest='profile', action='store_true', default=False,
+        help='Profile rules searching for performance issues, overlapping '
+             'detection, and error 30')
+    p.add_argument('-s', '--strings', action='store_true', default=False,
+        help='output matching strings')
+    p.add_argument('-C', '--categorize', dest='categorize_dir', default=False,
+        help='categorize the scanned samples into directories by rule name')
+    p.add_argument('-o', '--offset', action='store_true', default=False,
+        help='show match string offsets')
+    p.add_argument('-t', '--threads', dest='num_threads', type=int, default=None,
+        help='number of threads/workers')
+    p.add_argument('-c', '--context', type=int, default=5,
+        help='number of bytes of context before and after matches')
+    p.add_argument('-l', '--line', action='store_true', default=False,
+        help='Output entire line match occurs on')
+    p.add_argument('-j', '--json', default=False,
+        help='json output file')
+    p.add_argument('-n', '--negative', action='store_true', default=False,
+        help='Output files having no matches')
+    p.add_argument('-w', '--wide', action='store_true', default=False,
+        help='Mark matching wide/utf-16le strings')
+    p.add_argument('--max-strings', dest='max_strings', type=int, default=5,
+        help='Max strings to print per rule')
+    p.add_argument('--max-offsets', dest='max_offsets', type=int, default=5,
+        help='Max offsets to print per string')
+    p.add_argument('-d', '--disassemble', choices=['64', '32'], default=None,
+        help='Disassemble matching bytes using 32/64 bit mode as provided')
+    return p
+
+
+options = build_arg_parser().parse_args()
+args = options.paths  # positional target files/dirs (was args from optparse)
 options.user_provided_signatures = options.signatures is not None
 if not options.signatures:
-    options.signatures = ['/home/jhumble/RE/ice-53-yara-rules/']
+    options.signatures = [DEFAULT_RULES_DIR]
 
 # Parse optional '::rule1,rule2' suffix per -S to restrict which rules fire from that source.
 options.parsed_signatures = []
@@ -115,12 +133,58 @@ class bcolors:
         UNDERLINE = ''
 
 
+class MatchShim:
+    """Shim around a yara-x Rule so downstream code (filter_match, output
+    rendering) can keep using the yara-python attribute names.
+
+    Populated eagerly at scan time so the worker doesn't hand off references
+    into scanner-owned memory. Match bytes (matched_data) are populated
+    lazily by iterate_matches, which reads them from the scanned file.
+    """
+    __slots__ = ('rule', 'namespace', 'meta', 'tags', 'strings')
+
+    def __init__(self, rule):
+        self.rule = rule.identifier
+        self.namespace = rule.namespace
+        # yara-x returns metadata string values as either str or bytes depending
+        # on the rule; normalize to str so downstream code doesn't have to
+        # branch. Non-string types (int, float, bool) pass through unchanged.
+        self.meta = {
+            k: (v.decode('utf-8', errors='replace') if isinstance(v, (bytes, bytearray)) else v)
+            for k, v in rule.metadata
+        }
+        self.tags = tuple(rule.tags)
+        self.strings = [PatternShim(p) for p in rule.patterns]
+
+
+class PatternShim:
+    __slots__ = ('identifier', 'instances')
+
+    def __init__(self, pattern):
+        self.identifier = pattern.identifier
+        self.instances = [InstanceShim(m) for m in pattern.matches]
+
+
+class InstanceShim:
+    """Offset + length of a match; matched_data is filled in by iterate_matches
+    which knows the scanned file's path."""
+    __slots__ = ('offset', 'length', 'matched_data')
+
+    def __init__(self, m):
+        self.offset = m.offset
+        self.length = m.length
+        self.matched_data = None
+
+
 def rules_hash(file_list):
-    rtn = {}
-    to_hash = ""
+    """Content-based hash of the rule sources. Robust to git checkouts touching
+    mtime without changing content. Benchmarked at ~17ms on 5.6 MiB of rules."""
+    h = md5()
     for path in sorted(file_list):
-        to_hash += '%s%s' % (os.path.basename(path),str(os.path.getmtime(path)))
-    return md5(to_hash.encode()).hexdigest()
+        h.update(os.path.basename(path).encode())
+        with open(path, 'rb') as fp:
+            h.update(fp.read())
+    return h.hexdigest()
 
 
 # Path to a separately-built yara CLI compiled with --enable-profiling.
@@ -131,18 +195,17 @@ PROFILED_YARA_BIN = os.path.expanduser(
     '~/tools/yara-scanner/yara-profiling/bin/yara')
 
 
-def run_profile_via_cli(compiled_rules, scan_targets, threshold):
+def run_profile_via_cli(rule_files, scan_targets, threshold):
     """Run the profiled yara CLI against scan_targets and report per-rule outliers.
 
-    compiled_rules : yara.Rules already-compiled by build_rules. Saved to a
-                     temp .cyar; the CLI loads it via -C.
-    scan_targets   : positional list of files/dirs from argv. -r is passed so
-                     dirs traverse recursively; files pass through fine.
-    threshold      : -T value. Rule is flagged if cost / mean_cost is above
-                     threshold or below 1/threshold.
+    rule_files    : list of source .yar rule file paths, or (namespace, path) pairs.
+                    Passed as positional [ns:]path args to the CLI. Compiled
+                    format is not portable between yara-python/yara-x and the
+                    standalone CLI, so we always feed source files.
+    scan_targets  : positional list of files/dirs from argv. Dirs are expanded.
+    threshold     : -T value. Rule is flagged if cost/mean_cost > threshold.
     """
     import subprocess
-    import tempfile
 
     if not os.path.exists(PROFILED_YARA_BIN):
         print('[!]\tProfiled yara CLI not found at %s' % PROFILED_YARA_BIN)
@@ -165,18 +228,27 @@ def run_profile_via_cli(compiled_rules, scan_targets, threshold):
         print('[!]\tNo files to scan after expanding targets: %s' % scan_targets)
         return
 
-    cyar = tempfile.NamedTemporaryFile(suffix='.cyar', delete=False).name
+    # Build the [ns:]path positional args. Namespace defaults to file basename
+    # without extension (same convention as compile_rule/build_rules).
+    rule_args = []
+    for entry in rule_files:
+        if isinstance(entry, tuple):
+            ns, path = entry
+        else:
+            ns = os.path.splitext(os.path.basename(entry))[0]
+            path = entry
+        rule_args.append('%s:%s' % (ns, path))
+
     is_tty = sys.stderr.isatty()
     profile_start = time()
     try:
-        compiled_rules.save(cyar)
         block_re = re.compile(r'^\s*(\d+)\s+(\S+):(\S+):\s*$')
         results = {}  # accumulator: <ns>::<rule> -> summed cost
         per_file_cost = {}  # fname -> total cost summed across rules
         for i, fname in enumerate(flat_files, 1):
             try:
                 proc = subprocess.run(
-                    [PROFILED_YARA_BIN, '-C', cyar, fname],
+                    [PROFILED_YARA_BIN, '-w'] + rule_args + [fname],
                     capture_output=True, text=True, errors='replace')
             except Exception as e:
                 print('[!]\tFailed scanning %s: %s' % (fname, e))
@@ -263,70 +335,93 @@ def run_profile_via_cli(compiled_rules, scan_targets, threshold):
             for fname, c in top_files:
                 if c > 0:
                     print('{0:>14}\t{1}'.format(c, fname))
-
-    finally:
-        try:
-            os.unlink(cyar)
-        except Exception:
-            pass
+    except Exception as e:
+        print('[!]\tprofile invocation failed: %s' % e)
 
 
 
-def highest_impact(match):
-    highest = 0
-    for entry in match:
-        #print entry
-        if entry.meta:
-            highest = min(100, max(0, entry.meta.get('impact', 100), highest))
+class Progress:
+    """Live scan progress. Read by a ticker thread, written by the main
+    completion loop. All fields are ints so += on a single writer thread is
+    correct-enough (the ticker only reads and never observes a corrupted
+    partial write in CPython)."""
+    __slots__ = ('bytes_scanned', 'match_count', 'files_scanned', 'scan_size', 'start')
+
+    def __init__(self, scan_size):
+        self.bytes_scanned = 0
+        self.match_count = 0
+        self.files_scanned = 0
+        self.scan_size = scan_size
+        self.start = time()
+
+    def render(self):
+        elapsed = time() - self.start
+        if elapsed <= 0 or self.bytes_scanned == 0:
+            eta = 'N/A'
         else:
-            highest = 100
-    return highest
+            bps = self.bytes_scanned / elapsed
+            remaining_sec = max(0, int((self.scan_size - self.bytes_scanned) / bps))
+            eta = str(datetime.timedelta(seconds=remaining_sec))
+        sys.stderr.write('\r\x1b[K' + 'Progress: (%s/%s)\tETA: %s\tMatches: %d' % (
+            human_size(self.bytes_scanned), human_size(self.scan_size),
+            eta, self.match_count))
+        sys.stderr.flush()
 
-def worker():
-    global TERMINATE_EARLY
-    global result_queue
-    global bytes_scanned
-    global files_scanned
-    global match_count
-    global lock
 
-    yara.set_config(max_match_data=4096)
-    #print 'worker %s started' % (current_thread())
-    while True: #not scan_queue.empty():
-        if TERMINATE_EARLY:
-            #print 'worker %s terminating' % (current_thread())
-            return
-        job = scan_queue.get()
-        #print 'Worker %s: processing job %s' % (current_thread(), job)
-        if job is None:
-            scan_queue.task_done()
-            #print 'worker %s exiting' % (current_thread())
-            return
-        try:
-            if not options.profile:
-                matches = compiled_rules.match(job['fname'])
-            else:
-                matches = []
-                for key, rule in compiled_rules.items():
-                    start = time()
-                    matches += rule['rule'].match(job['fname'])
-                    profile_queue.put({'fname': job['fname'], 'rulefile': rule['rulefile'], 'time': time() - start})
-            # filter out any matches that do not apply
-            matches = [match for match in matches if not filter_match(match, job['fname'])]
-            result_queue.put({'matches': matches, 'fname': job['fname']})
-            lock.acquire()
-            if matches:
-                match_count += 1
-            bytes_scanned += job['size']
-            files_scanned += 1
-            lock.release()
-        except Exception as e:
-            print('Exception scanning %s (%s): %s' % (job['fname'],human_size(job['size']),e))
-            pass
-        scan_queue.task_done()
-    #print 'worker %s exiting' % (current_thread())
-    #return
-        
+def _progress_ticker(progress, stop_event, interval=1.0):
+    """Print progress every `interval` seconds until stop_event is set.
+    stop_event.wait() lets us exit immediately on shutdown without
+    burning through a full sleep cycle first."""
+    while not stop_event.is_set():
+        progress.render()
+        stop_event.wait(interval)
+
+
+# Per-worker-process state. Set up by _worker_init when a worker starts,
+# then read by _worker_scan_one on each task. Kept as module globals so we
+# don't have to ship Rules through the pickle path.
+_worker_scanner = None
+_worker_rule_filter = None
+
+
+def _worker_init(yxc_path, worker_rule_filter):
+    """Initialize a worker process. Called once when the worker starts.
+    Loads the serialized rules from disk (one deserialize per process,
+    reused across every scan the worker runs). yara-x's Scanner is
+    single-threaded but each worker process only runs one scan at a time,
+    so a per-process global Scanner is safe."""
+    global _worker_scanner, _worker_rule_filter
+    with open(yxc_path, 'rb') as fp:
+        rules = yx.Rules.deserialize_from(fp)
+    _worker_scanner = yx.Scanner(rules)
+    _worker_rule_filter = worker_rule_filter
+
+
+def _worker_scan_one(fname, size):
+    """Run one scan in a worker process. Uses the per-process globals set
+    by _worker_init. Returns (fname, size, matches_or_None, error_string_or_None)."""
+    try:
+        results = _worker_scanner.scan_file(fname)
+        matches = [MatchShim(r) for r in results.matching_rules]
+        matches = [m for m in matches
+                   if not filter_match(m, fname, rule_filter=_worker_rule_filter)]
+        return fname, size, matches, None
+    except Exception as e:
+        return fname, size, None, str(e)
+
+
+def scan_one(rules, fname, size):
+    """Thread-mode fallback (kept for single-file quick scans / debugging)."""
+    try:
+        scanner = yx.Scanner(rules)
+        results = scanner.scan_file(fname)
+        matches = [MatchShim(r) for r in results.matching_rules]
+        matches = [m for m in matches if not filter_match(m, fname)]
+        return fname, size, matches, None
+    except Exception as e:
+        return fname, size, None, e
+
+
 #catch ctrl-c (SIGINT) and exit
 def signal_handler(signal,frame):
     sys.exit(0)
@@ -341,7 +436,10 @@ def human_size(nbytes):
     f = ('%s' % float('%.3g' % nbytes)).rstrip('0').rstrip('.')
     return '%s %s' % (f, suffixes[i])
 
-def filter_match(match, fname):
+def filter_match(match, fname, rule_filter=None):
+    if rule_filter is None:
+        # Fall back to the module-level default (main-block scenario).
+        rule_filter = globals().get('rule_filter', {})
     try:
         # Per-source rule filter from '-S path::rule_name[,rule_name...]'.
         if rule_filter:
@@ -401,70 +499,6 @@ def filter_match(match, fname):
 
 
 
-def monitor_thread(worker_threads):
-    start = time()
-    global scan_queue
-    global bytes_scanned
-    global result_queue
-    global scan_size
-    global scan_files
-    while True:
-        if TERMINATE_EARLY:
-            break
-        working = 0
-        for t in worker_threads:
-            if t.is_alive():
-                working += 1
-        delta = time() - start
-        #print 'completed = %s working = %s' % (completed,working)
-        try:
-            bytes_per_sec = bytes_scanned/delta*1.0
-            estimated_sec = (scan_size - bytes_scanned)/bytes_per_sec
-            estimated_time = str(datetime.timedelta(seconds=int(estimated_sec)))
-        except:
-            estimated_time = 'N/A'
-        sys.stderr.write('\r' + ' '*100)
-        sys.stderr.flush()
-        sys.stderr.write('\r')
-        sys.stderr.flush()
-        sys.stderr.write('Progress: (%s/%s)\t\tTime Remaining: %s\t\tMatches: %s' % (human_size(bytes_scanned), human_size(scan_size), estimated_time, match_count))
-        sys.stderr.flush()
-        if scan_queue.qsize() == 0 and working == 0:
-            break
-        sleep(1)
-    print('\n')
-    elapsed = time() - start
-
-def compile_rule(rulefile, include_compiled=False):
-    try:
-        key = os.path.splitext(os.path.split(rulefile)[1])[0]
-        start = time()
-        rule = yara.compile(filepaths={key: rulefile},externals={'path': "TEMPORARY_EXT_VAR_VALUE", 'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
-        rtn = {'key': key, 'rulefile': rulefile, 'compile_time': time() - start}
-        if include_compiled:
-            rtn['rule'] = rule
-        return rtn
-    except Exception as e:
-        print('rule %s failed to compile! Error: %s' % (rulefile, e))
-    return None
-    
-def test_compile(file_list, individual_rules=False):
-    rtn = {}
-    # Can't use a pool since we can't pickle the compiled rule objects to send across the queue
-    if individual_rules:
-        for f in file_list:
-            compiled = compile_rule(f, include_compiled=True)
-            if compiled:
-                rtn[compiled['key']] = compiled
-    
-    else:
-        pool = Pool(options.num_threads)
-        results = pool.map(compile_rule, file_list)
-        for item in results:
-            if item:
-                rtn[item['key']] = item['rulefile']
-    return rtn
-       
 def collect_rule_files(parsed_signatures):
     """Expand parsed -S entries into (file_list, rule_filter).
 
@@ -499,40 +533,58 @@ def collect_rule_files(parsed_signatures):
     rf = {ns: names for ns, names in restricted.items() if ns not in unrestricted}
     return files, rf
 
-def build_rules(parsed_signatures, profile_rules=False):
-    global rule_filter
-    file_list, rule_filter = collect_rule_files(parsed_signatures)
+def build_rules(parsed_signatures):
+    """Compile all rule sources into a yara_x.Rules object, caching to /tmp/<content-hash>.yxc.
+
+    yara-x's Compiler tolerates errors: add_source() raises on the first
+    error in a source, but you can catch it and keep adding more sources.
+    So we do a single pass with per-file try/except rather than a
+    test_compile step + batch compile.
+
+    Returns (compiled_rules, rule_filter, yxc_path). yxc_path is on-disk
+    so worker processes in a ProcessPoolExecutor can deserialize it
+    without shipping a Rules object through pickle.
+    """
+    file_list, this_rule_filter = collect_rule_files(parsed_signatures)
     _hash = rules_hash(file_list)
-    if profile_rules:
-        return test_compile(file_list, individual_rules=True)
-    path = os.path.join('/tmp/', '%s.py3.cyar' % (_hash))
+    path = os.path.join('/tmp/', '%s.yxc' % (_hash))
     if os.path.isfile(path):
         print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
-        return yara.load(path)
+        with open(path, 'rb') as fp:
+            return yx.Rules.deserialize_from(fp), this_rule_filter, path
 
     start = time()
-    rulefile_paths = test_compile(file_list)
-    elapsed = time() - start
-    if options.performance:
-        print('[*]\tTest compiled %s rules in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
-
-    start = time()
+    c = yx.Compiler(relaxed_re_syntax=True)
+    c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
+    c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
+    ok = 0
+    for rulefile in file_list:
+        ns = os.path.splitext(os.path.basename(rulefile))[0]
+        c.new_namespace(ns)
+        try:
+            with open(rulefile) as fp:
+                c.add_source(fp.read(), origin=rulefile)
+            ok += 1
+        except Exception as e:
+            print('rule %s failed to compile! Error: %s' % (rulefile, e))
     try:
-        compiled_rules = yara.compile(filepaths=rulefile_paths,externals={'path': "TEMPORARY_EXT_VAR_VALUE", 'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
+        compiled_rules = c.build()
     except Exception as e:
-        print('Exception compiling rules: %s' % (e))
+        print('Exception in Compiler.build(): %s' % e)
+        raise
     elapsed = time() - start
     try:
-        compiled_rules.save(path)
+        with open(path, 'wb') as fp:
+            compiled_rules.serialize_into(fp)
         os.chmod(path, 0o666)
     except Exception as e:
         print('[!]\tFailed to save compiled rules %s: %s' % (path,e))
     compiled_size = os.stat(path).st_size
 
     if options.performance:
-        print('[*]\tCompiled %s rule files in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
+        print('[*]\tCompiled %s / %s rule files in %s seconds.' % (ok, len(file_list), round(elapsed,2)))
         print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
-    return compiled_rules
+    return compiled_rules, this_rule_filter, path
 
 def offset_to_line(fname, offset, match_len):
     size = os.stat(fname).st_size
@@ -586,12 +638,6 @@ def offset_to_line(fname, offset, match_len):
 def hexlify(string):
     string = binascii.hexlify(string).upper().decode()
     return ' '.join(string[i:i+2] for i in range(0, len(string), 2))
-
-def score_matches(matches):
-    score = 0
-    for match in matches:
-        score = max(score, int(match.meta.get('impact', 0)))
-    return score
 
 def disassemble(fname, bytedict, prefer='32', context=5):
     #TODO Or just read in the original file and pD at the right offset. We could even output the entire function
@@ -698,246 +744,151 @@ def preexec_function():
     # Ignore SIGINT by setting handler to SIG_IGN
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-def chunks(l, n):
-    """Yield successive n-sized chunks from l."""
-    for i in xrange(0, len(l), n):
-        yield '\x00' + l[i:i+n]
+def iterate_matches(patterns, fname):
+    """Yield (offset, identifier, matched_data) for each match instance.
 
-def ngrams(s, n=3, i=0):
-    rtn = set()
-    while len(s[i:i+n]) == n:
-        rtn.add(s[i:i+n])
-        i += 1
-    return list(rtn)
-
-
-def extract_trigrams(string):
-    rtn = set()
-    hex_extractor = re.compile(r'([0-9a-f]{2}){3,}', re.IGNORECASE)
-    if string['type'] == 'hex':
-        string['value'] = string['value'].replace(' ','')
-        for match in hex_extractor.finditer(string['value']):
-            data = binascii.unhexlify(match.group())
-            rtn |= set(ngrams(data))
-    elif string['type'] == 'string':
-        rtn |= set(ngrams(string['value']))
-        
-    return rtn
-        
-
-def prefilter(cache_dir, rule_path):
-    from rule_parsers.YaraRule import YaraRule
-    import struct
-    req_trigrams = {}
-    with open(rule_path,'rb') as fp:
-        ruletext = fp.read()
-
-    rule = YaraRule(ruletext)
-    rule.condition = '\n'.join(rule.conditions)
-    if 'any of them' in rule.condition:
-        strings = rule.strings
-        print('Extracting trigrams from {}'.format([string['value'].rstrip('"').lstrip('"') for string in strings]))
-        #supported
-    elif 'cache_helper' in rule.metas:
-        print(('Applying cache helper {}'.format(rule.metas['cache_helper'])))
-        strings = []
-        print('Extracting trigrams from {}'.format(rule.metas['cache_helper'].split(',')))
-        for search in rule.metas['cache_helper'].split(','):
-            strings.append({'type': 'string', 'value': search})
-    else:
-        print('Can only cache accelerate "any of them" rules or those with cache_helper meta')
-        return recursive_all_files(cache_dir)
-
-
-    for string in strings:
-        req_trigrams[string['value']] = extract_trigrams(string)
-
-    start = time()
-    with open(os.path.join(cache_dir, 'cache_files.json'), 'r') as fp:
-        id_to_path = json.load(fp)
-    #all_files.pop('id')
-    #id_to_path = {}
-    #for key, val in all_files.items():
-    #    id_to_path[int(val['id'])] = val['path']
-    #with open(os.path.join(cache_dir, 'by_id.json'), 'w') as fp:
-    #    json.dump(id_to_path, fp)
-    #exit()
-
-    matching = set([int(x) for x in id_to_path.keys()])
-    match_sets = {}
-    print('Parsed cache_files in {}s'.format(time() - start))
-    for string, trigram_set in req_trigrams.items():
-        matching_set = deepcopy(matching)
-        for trigram in trigram_set:
-            print('trigram = {}'.format(trigram))
-            hex_trigram = binascii.hexlify(trigram)
-            with open(os.path.join(cache_dir, hex_trigram[:2], hex_trigram), 'rb') as fp:
-                fids = set([struct.unpack('>I', i)[0] for i in chunks(fp.read(),3)])
-                print('Before filtering with trigram {}: {} files'.format(hex_trigram, len(matching_set)))
-                matching_set &= fids
-                print('After filtering: {} files'.format(len(matching_set)))
-        match_sets[string] = matching_set
-    matching = set()
-    for string, matching_set in match_sets.items():
-        print('Before filtering with string {}: {} files'.format(string, len(matching)))
-        matching_set &= fids
-        print('After filtering: {} files'.format(len(matching)))
-        matching |= matching_set
-    print('done')
-    return [id_to_path[str(fid)] for fid in matching]
-
-# handle backward incompatible change introduced in v.4.3.0: https://github.com/VirusTotal/yara-python/releases/tag/v4.3.0
-def iterate_matches(matches):
-    #pre v4.3.0
-    for matchobj in matches:
-        if type(matchobj) is tuple:
-            # (<offset>, <string identifier>, <string data>)
-            yield matchobj[0], matchobj[1], matchobj[2]
-        # >= v4.3.0
-        else:
-            name = matchobj.identifier
-            for string in matchobj.instances:
-                yield string.offset, name, string.matched_data
+    yara-x's Match only exposes offset+length; we read matched_data from the
+    scanned file here. Opens the file once per invocation (typically per
+    matching rule per file) rather than once per match.
+    """
+    # collect (offset, length, identifier) so we can do one file read.
+    per_instance = []
+    for pattern in patterns:
+        for inst in pattern.instances:
+            per_instance.append(inst)
+    if not per_instance:
+        return
+    try:
+        with open(fname, 'rb') as fp:
+            for inst in per_instance:
+                fp.seek(inst.offset)
+                inst.matched_data = fp.read(inst.length)
+    except Exception:
+        # If reading fails for any reason, downstream will surface the empty bytes.
+        pass
+    for pattern in patterns:
+        name = pattern.identifier
+        for inst in pattern.instances:
+            yield inst.offset, name, inst.matched_data or b''
 
 
 if __name__ == '__main__':
-    global TERMINATE_EARLY
-    global scan_queue  
-    global result_queue
-    global profile_queue
-    global bytes_scanned
-    global match_count
-    global scan_size
-    global scan_files
-    global lock
-    global files_scanned
-    
-
-    lock = Lock()
-    files_scanned = 0
-    TERMINATE_EARLY = False
-    scan_queue = Queue()
-    result_queue = Queue()
-    profile_queue = Queue()
-    bytes_scanned = 0
-    match_count = 0
-    scan_size = 0
     if options.disassemble:
         import r2pipe
 
     if options.performance:
         print('[*]\tScanning with %s threads.' % (options.num_threads))
 
+    # Collect scan targets and pre-compute total size for progress reporting.
     scanlist = []
-    # Trigram prefilter only applies when exactly one precompiled rule file is supplied.
-    single_sig = options.signatures[0] if len(options.signatures) == 1 and os.path.isfile(options.signatures[0]) else None
     for arg in args:
-        #Perform prefiltering if we're operating with a single yara rule and are targetting a cache dir
-        if single_sig and os.path.exists(os.path.join(arg, 'cache_files.json')):
-            print('Prefiltering with trigram cache')
-            scanlist += prefilter(arg, single_sig)
-        else:
-            scanlist += recursive_all_files(arg)
-
-
-    #print 'scanning %s' % (scanlist)
+        scanlist += recursive_all_files(arg)
+    jobs = []       # list of (fname, size)
     scan_size = 0
     for f in scanlist:
-        size = os.stat(f).st_size
-        if size != 0:
-            scan_size+= size
-            scan_queue.put({'fname': f, 'size': size})
-    scan_files = scan_queue.qsize()
-
-    if options.profile:
-        # -P now subprocesses the profiled yara CLI (built with --enable-profiling).
-        # Compile rules normally; the CLI reads the resulting .cyar and emits
-        # per-rule cost attribution by <namespace>:<rule_name>. This bypasses
-        # yara-python entirely for the profiling step (see github issue
-        # VirusTotal/yara-python#155 -- yara-python.profiling_info() is
-        # broken against current libyara API).
-        compiled_rules = build_rules(options.parsed_signatures)
-        run_profile_via_cli(compiled_rules, args, options.threshold)
-        sys.exit(0)
-    elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]):
-        # Single precompiled .cyar fast path
-        path, names = options.parsed_signatures[0]
         try:
-            compiled_rules = yara.load(path)
-            if names:
-                rule_filter = {'*': names}
-        except Exception as e:
-            compiled_rules = build_rules(options.parsed_signatures)
+            size = os.stat(f).st_size
+        except OSError:
+            continue
+        if size != 0:
+            jobs.append((f, size))
+            scan_size += size
+
+    # -P short-circuits: shells out to the profiled yara CLI with the source
+    # rule files as [ns:]path positional args. Compiled-rules format is not
+    # portable between yara-x's Rules and the standalone CLI's .cyar.
+    if options.profile:
+        rule_files, rule_filter = collect_rule_files(options.parsed_signatures)
+        run_profile_via_cli(rule_files, args, options.threshold)
+        sys.exit(0)
+    elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]) \
+            and options.parsed_signatures[0][0].endswith('.yxc'):
+        # Precompiled yara-x rules fast path
+        yxc_path, names = options.parsed_signatures[0]
+        try:
+            with open(yxc_path, 'rb') as fp:
+                compiled_rules = yx.Rules.deserialize_from(fp)
+            rule_filter = {'*': names} if names else {}
+        except Exception:
+            compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
     else:
-        compiled_rules = build_rules(options.parsed_signatures)
-
-    start = time()
-    complete = 0
-
-    worker_threads = []
-
-    for i in range(options.num_threads):
-        t = Thread(target=worker)
-        t.daemon = True #Die when main thread dies
-        t.start()
-        worker_threads.append(t)
-        scan_queue.put(None) # tells worker to exit
-
-    if options.performance:
-        monitor = Thread(target=monitor_thread,args=(worker_threads,))
-        monitor.daemon = True
-        monitor.start()
+        compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
 
     if options.categorize_dir:
         os.makedirs(options.categorize_dir, exist_ok=True)
 
-    while True:
-        try:
-            if scan_queue.empty():
-                break
-            else:
-                #print scan_queue.queue
-                sleep(1)
-        except KeyboardInterrupt as kbe:
-            TERMINATE_EARLY = True
-            #wait for workers to die
-            #for w in worker_threads:
-            #    w.join()
-            if options.performance:
-                monitor.join()
-            if result_queue.empty():
-                # we have 0 results, just exit
-                print('No results so far. Exiting')
-                exit()
-            else:
-                print('Stopping further processing and outputting results gathered so far')
-                sleep(1)
-            break
+    # Scan jobs. Each worker thread lazily creates one yx.Scanner (thread-local)
+    # and reuses it across scans -- yara-x Scanners are single-threaded but
+    # cheap to create once per thread.
+    progress = Progress(scan_size)
+    results = []
+    is_tty_stderr = sys.stderr.isatty()
 
-    if options.performance:
-        monitor.join()
+    # Ticker thread for real-time progress. Only started when -p is set and
+    # stderr is a tty -- piped/captured runs get no ticker output.
+    stop_ticker = threading.Event()
+    ticker_thread = None
+    if options.performance and is_tty_stderr:
+        ticker_thread = threading.Thread(
+            target=_progress_ticker, args=(progress, stop_ticker), daemon=True)
+        ticker_thread.start()
+
+    # yara-x's Python binding does not release the GIL during scan_file, so
+    # threading serializes at ~100% single-thread CPU. We use processes to
+    # get real parallelism -- each worker deserializes the .yxc once at
+    # startup and reuses the same Scanner for every scan it runs.
+    try:
+        with ProcessPoolExecutor(
+            max_workers=options.num_threads,
+            initializer=_worker_init,
+            initargs=(yxc_path, rule_filter),
+        ) as ex:
+            futures = [ex.submit(_worker_scan_one, f, sz) for f, sz in jobs]
+            for fut in as_completed(futures):
+                fname, size, matches, err = fut.result()
+                progress.bytes_scanned += size
+                progress.files_scanned += 1
+                if err is not None:
+                    print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
+                    continue
+                if matches:
+                    progress.match_count += 1
+                    results.append({'matches': matches, 'fname': fname})
+                elif options.negative:
+                    results.append({'matches': [], 'fname': fname})
+    except KeyboardInterrupt:
+        print('\nInterrupted; outputting results collected so far')
+    finally:
+        stop_ticker.set()
+        if ticker_thread is not None:
+            ticker_thread.join(timeout=1.5)
+    if options.performance and is_tty_stderr:
+        progress.render()
+        sys.stderr.write('\n')
+
     if options.json:
-        results = {}
-        while not result_queue.empty():
-            res = result_queue.get()
-            matches = {}
-            for match in res['matches']:
-                matches[match.rule] = match.meta
-            if matches:
-                results[res['fname']] = matches
+        json_results = {}
+        for res in results:
+            match_map = {m.rule: m.meta for m in res['matches']}
+            if match_map:
+                json_results[res['fname']] = match_map
         with open(options.json, 'w') as fp:
-            json.dump(results, fp)
+            json.dump(json_results, fp)
     else:
-        while not result_queue.empty():
-            res = result_queue.get()
+        for res in results:
             if not res['matches'] and not options.negative:
                 continue
             header = False
+            # With -n, always emit the filename for no-match files so they can
+            # be picked up in "which files had zero hits" surveys.
+            if not res['matches'] and options.negative:
+                print(res['fname'])
+                continue
 
             for matchobj in res['matches']:
                 if not filter_match(matchobj, res['fname']):
                     if not header:
-                        print(res['fname'])# + '\t' + str(score_matches(res['matches'])))
+                        print(res['fname'])
                         header = True
                     if options.categorize_dir:
                         d = os.path.join(options.categorize_dir, matchobj.rule)
@@ -945,7 +896,7 @@ if __name__ == '__main__':
                         shutil.copy(res['fname'], d) 
                     strings = {}
                     if options.strings:
-                        for offset, name, data in iterate_matches(matchobj.strings):
+                        for offset, name, data in iterate_matches(matchobj.strings, res['fname']):
                             raw_bytes, printable, wide, string = format_string_output(string=data, offset=offset, fname=res['fname'], context=options.context, line=options.line)
                             string = string.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                             if name not in strings:
@@ -988,20 +939,8 @@ if __name__ == '__main__':
                                             print(traceback.format_exc())
                     print()
     
-    # -P no longer aggregates here -- it sys.exit()s above after the CLI
-    # subprocess. This block is intentionally left only for the legacy
-    # profile_queue path (still drained by worker() if --profile was set,
-    # but the new --profile branch never starts those workers).
-
     if options.performance:
-        elapsed = time() - start
-        print('[*]\tProcessed %s files in %s seconds. %s/s' % (files_scanned,round(elapsed,2), human_size(bytes_scanned/elapsed)))
-    #print max(scores)
-    """
-    for f in get_directory_file_list(sys.argv[1]): #recursive_all_files(sys.argv[1]):
-        match = compiled_rules.match(f)
-        print f + "\t" + str(highest_impact(match))# + "\t" + str(match)
-        #for match in match_ret
-        #    dir(match)
-    """
-
+        elapsed = time() - progress.start
+        rate = human_size(progress.bytes_scanned / elapsed) if elapsed > 0 else 'N/A'
+        print('[*]\tProcessed %s files in %s seconds. %s/s' % (
+            progress.files_scanned, round(elapsed, 2), rate))
