@@ -7,9 +7,8 @@ import re
 import binascii
 import glob
 import shutil
-from copy import deepcopy
 
-import simplejson as json
+import json
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from utils import recursive_all_files
 from time import sleep, time
@@ -272,16 +271,6 @@ def run_profile_via_cli(compiled_rules, scan_targets, threshold):
 
 
 
-def highest_impact(match):
-    highest = 0
-    for entry in match:
-        #print entry
-        if entry.meta:
-            highest = min(100, max(0, entry.meta.get('impact', 100), highest))
-        else:
-            highest = 100
-    return highest
-
 def worker():
     global TERMINATE_EARLY
     global result_queue
@@ -303,14 +292,7 @@ def worker():
             #print 'worker %s exiting' % (current_thread())
             return
         try:
-            if not options.profile:
-                matches = compiled_rules.match(job['fname'])
-            else:
-                matches = []
-                for key, rule in compiled_rules.items():
-                    start = time()
-                    matches += rule['rule'].match(job['fname'])
-                    profile_queue.put({'fname': job['fname'], 'rulefile': rule['rulefile'], 'time': time() - start})
+            matches = compiled_rules.match(job['fname'])
             # filter out any matches that do not apply
             matches = [match for match in matches if not filter_match(match, job['fname'])]
             result_queue.put({'matches': matches, 'fname': job['fname']})
@@ -435,34 +417,25 @@ def monitor_thread(worker_threads):
     print('\n')
     elapsed = time() - start
 
-def compile_rule(rulefile, include_compiled=False):
+def compile_rule(rulefile):
+    """Compile a single rule file. Returns None if compilation fails."""
     try:
         key = os.path.splitext(os.path.split(rulefile)[1])[0]
-        start = time()
-        rule = yara.compile(filepaths={key: rulefile},externals={'path': "TEMPORARY_EXT_VAR_VALUE", 'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
-        rtn = {'key': key, 'rulefile': rulefile, 'compile_time': time() - start}
-        if include_compiled:
-            rtn['rule'] = rule
-        return rtn
+        yara.compile(filepaths={key: rulefile},
+                     externals={'path': "TEMPORARY_EXT_VAR_VALUE",
+                                'normalized_path': "TEMPORARY_EXT_VAR_VALUE"})
+        return {'key': key, 'rulefile': rulefile}
     except Exception as e:
         print('rule %s failed to compile! Error: %s' % (rulefile, e))
     return None
-    
-def test_compile(file_list, individual_rules=False):
+
+def test_compile(file_list):
+    """Test-compile each rule in parallel; return {namespace: path} of survivors."""
     rtn = {}
-    # Can't use a pool since we can't pickle the compiled rule objects to send across the queue
-    if individual_rules:
-        for f in file_list:
-            compiled = compile_rule(f, include_compiled=True)
-            if compiled:
-                rtn[compiled['key']] = compiled
-    
-    else:
-        pool = Pool(options.num_threads)
-        results = pool.map(compile_rule, file_list)
-        for item in results:
-            if item:
-                rtn[item['key']] = item['rulefile']
+    pool = Pool(options.num_threads)
+    for item in pool.map(compile_rule, file_list):
+        if item:
+            rtn[item['key']] = item['rulefile']
     return rtn
        
 def collect_rule_files(parsed_signatures):
@@ -499,12 +472,10 @@ def collect_rule_files(parsed_signatures):
     rf = {ns: names for ns, names in restricted.items() if ns not in unrestricted}
     return files, rf
 
-def build_rules(parsed_signatures, profile_rules=False):
+def build_rules(parsed_signatures):
     global rule_filter
     file_list, rule_filter = collect_rule_files(parsed_signatures)
     _hash = rules_hash(file_list)
-    if profile_rules:
-        return test_compile(file_list, individual_rules=True)
     path = os.path.join('/tmp/', '%s.py3.cyar' % (_hash))
     if os.path.isfile(path):
         print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
@@ -586,12 +557,6 @@ def offset_to_line(fname, offset, match_len):
 def hexlify(string):
     string = binascii.hexlify(string).upper().decode()
     return ' '.join(string[i:i+2] for i in range(0, len(string), 2))
-
-def score_matches(matches):
-    score = 0
-    for match in matches:
-        score = max(score, int(match.meta.get('impact', 0)))
-    return score
 
 def disassemble(fname, bytedict, prefer='32', context=5):
     #TODO Or just read in the original file and pD at the right offset. We could even output the entire function
@@ -698,127 +663,30 @@ def preexec_function():
     # Ignore SIGINT by setting handler to SIG_IGN
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-def chunks(l, n):
-    """Yield successive n-sized chunks from l."""
-    for i in xrange(0, len(l), n):
-        yield '\x00' + l[i:i+n]
-
-def ngrams(s, n=3, i=0):
-    rtn = set()
-    while len(s[i:i+n]) == n:
-        rtn.add(s[i:i+n])
-        i += 1
-    return list(rtn)
-
-
-def extract_trigrams(string):
-    rtn = set()
-    hex_extractor = re.compile(r'([0-9a-f]{2}){3,}', re.IGNORECASE)
-    if string['type'] == 'hex':
-        string['value'] = string['value'].replace(' ','')
-        for match in hex_extractor.finditer(string['value']):
-            data = binascii.unhexlify(match.group())
-            rtn |= set(ngrams(data))
-    elif string['type'] == 'string':
-        rtn |= set(ngrams(string['value']))
-        
-    return rtn
-        
-
-def prefilter(cache_dir, rule_path):
-    from rule_parsers.YaraRule import YaraRule
-    import struct
-    req_trigrams = {}
-    with open(rule_path,'rb') as fp:
-        ruletext = fp.read()
-
-    rule = YaraRule(ruletext)
-    rule.condition = '\n'.join(rule.conditions)
-    if 'any of them' in rule.condition:
-        strings = rule.strings
-        print('Extracting trigrams from {}'.format([string['value'].rstrip('"').lstrip('"') for string in strings]))
-        #supported
-    elif 'cache_helper' in rule.metas:
-        print(('Applying cache helper {}'.format(rule.metas['cache_helper'])))
-        strings = []
-        print('Extracting trigrams from {}'.format(rule.metas['cache_helper'].split(',')))
-        for search in rule.metas['cache_helper'].split(','):
-            strings.append({'type': 'string', 'value': search})
-    else:
-        print('Can only cache accelerate "any of them" rules or those with cache_helper meta')
-        return recursive_all_files(cache_dir)
-
-
-    for string in strings:
-        req_trigrams[string['value']] = extract_trigrams(string)
-
-    start = time()
-    with open(os.path.join(cache_dir, 'cache_files.json'), 'r') as fp:
-        id_to_path = json.load(fp)
-    #all_files.pop('id')
-    #id_to_path = {}
-    #for key, val in all_files.items():
-    #    id_to_path[int(val['id'])] = val['path']
-    #with open(os.path.join(cache_dir, 'by_id.json'), 'w') as fp:
-    #    json.dump(id_to_path, fp)
-    #exit()
-
-    matching = set([int(x) for x in id_to_path.keys()])
-    match_sets = {}
-    print('Parsed cache_files in {}s'.format(time() - start))
-    for string, trigram_set in req_trigrams.items():
-        matching_set = deepcopy(matching)
-        for trigram in trigram_set:
-            print('trigram = {}'.format(trigram))
-            hex_trigram = binascii.hexlify(trigram)
-            with open(os.path.join(cache_dir, hex_trigram[:2], hex_trigram), 'rb') as fp:
-                fids = set([struct.unpack('>I', i)[0] for i in chunks(fp.read(),3)])
-                print('Before filtering with trigram {}: {} files'.format(hex_trigram, len(matching_set)))
-                matching_set &= fids
-                print('After filtering: {} files'.format(len(matching_set)))
-        match_sets[string] = matching_set
-    matching = set()
-    for string, matching_set in match_sets.items():
-        print('Before filtering with string {}: {} files'.format(string, len(matching)))
-        matching_set &= fids
-        print('After filtering: {} files'.format(len(matching)))
-        matching |= matching_set
-    print('done')
-    return [id_to_path[str(fid)] for fid in matching]
-
-# handle backward incompatible change introduced in v.4.3.0: https://github.com/VirusTotal/yara-python/releases/tag/v4.3.0
 def iterate_matches(matches):
-    #pre v4.3.0
+    """Yield (offset, identifier, matched_data) for each match instance."""
     for matchobj in matches:
-        if type(matchobj) is tuple:
-            # (<offset>, <string identifier>, <string data>)
-            yield matchobj[0], matchobj[1], matchobj[2]
-        # >= v4.3.0
-        else:
-            name = matchobj.identifier
-            for string in matchobj.instances:
-                yield string.offset, name, string.matched_data
+        name = matchobj.identifier
+        for string in matchobj.instances:
+            yield string.offset, name, string.matched_data
 
 
 if __name__ == '__main__':
     global TERMINATE_EARLY
-    global scan_queue  
+    global scan_queue
     global result_queue
-    global profile_queue
     global bytes_scanned
     global match_count
     global scan_size
     global scan_files
     global lock
     global files_scanned
-    
 
     lock = Lock()
     files_scanned = 0
     TERMINATE_EARLY = False
     scan_queue = Queue()
     result_queue = Queue()
-    profile_queue = Queue()
     bytes_scanned = 0
     match_count = 0
     scan_size = 0
@@ -829,15 +697,8 @@ if __name__ == '__main__':
         print('[*]\tScanning with %s threads.' % (options.num_threads))
 
     scanlist = []
-    # Trigram prefilter only applies when exactly one precompiled rule file is supplied.
-    single_sig = options.signatures[0] if len(options.signatures) == 1 and os.path.isfile(options.signatures[0]) else None
     for arg in args:
-        #Perform prefiltering if we're operating with a single yara rule and are targetting a cache dir
-        if single_sig and os.path.exists(os.path.join(arg, 'cache_files.json')):
-            print('Prefiltering with trigram cache')
-            scanlist += prefilter(arg, single_sig)
-        else:
-            scanlist += recursive_all_files(arg)
+        scanlist += recursive_all_files(arg)
 
 
     #print 'scanning %s' % (scanlist)
@@ -937,7 +798,7 @@ if __name__ == '__main__':
             for matchobj in res['matches']:
                 if not filter_match(matchobj, res['fname']):
                     if not header:
-                        print(res['fname'])# + '\t' + str(score_matches(res['matches'])))
+                        print(res['fname'])
                         header = True
                     if options.categorize_dir:
                         d = os.path.join(options.categorize_dir, matchobj.rule)
@@ -988,20 +849,6 @@ if __name__ == '__main__':
                                             print(traceback.format_exc())
                     print()
     
-    # -P no longer aggregates here -- it sys.exit()s above after the CLI
-    # subprocess. This block is intentionally left only for the legacy
-    # profile_queue path (still drained by worker() if --profile was set,
-    # but the new --profile branch never starts those workers).
-
     if options.performance:
         elapsed = time() - start
         print('[*]\tProcessed %s files in %s seconds. %s/s' % (files_scanned,round(elapsed,2), human_size(bytes_scanned/elapsed)))
-    #print max(scores)
-    """
-    for f in get_directory_file_list(sys.argv[1]): #recursive_all_files(sys.argv[1]):
-        match = compiled_rules.match(f)
-        print f + "\t" + str(highest_impact(match))# + "\t" + str(match)
-        #for match in match_ret
-        #    dir(match)
-    """
-
