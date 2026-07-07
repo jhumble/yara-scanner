@@ -343,6 +343,43 @@ def run_profile_via_cli(rule_files, scan_targets, threshold):
 _thread_local = threading.local()
 
 
+class Progress:
+    """Live scan progress. Read by a ticker thread, written by the main
+    completion loop. All fields are ints so += on a single writer thread is
+    correct-enough (the ticker only reads and never observes a corrupted
+    partial write in CPython)."""
+    __slots__ = ('bytes_scanned', 'match_count', 'files_scanned', 'scan_size', 'start')
+
+    def __init__(self, scan_size):
+        self.bytes_scanned = 0
+        self.match_count = 0
+        self.files_scanned = 0
+        self.scan_size = scan_size
+        self.start = time()
+
+    def render(self):
+        elapsed = time() - self.start
+        if elapsed <= 0 or self.bytes_scanned == 0:
+            eta = 'N/A'
+        else:
+            bps = self.bytes_scanned / elapsed
+            remaining_sec = max(0, int((self.scan_size - self.bytes_scanned) / bps))
+            eta = str(datetime.timedelta(seconds=remaining_sec))
+        sys.stderr.write('\r\x1b[K' + 'Progress: (%s/%s)\tETA: %s\tMatches: %d' % (
+            human_size(self.bytes_scanned), human_size(self.scan_size),
+            eta, self.match_count))
+        sys.stderr.flush()
+
+
+def _progress_ticker(progress, stop_event, interval=1.0):
+    """Print progress every `interval` seconds until stop_event is set.
+    stop_event.wait() lets us exit immediately on shutdown without
+    burning through a full sleep cycle first."""
+    while not stop_event.is_set():
+        progress.render()
+        stop_event.wait(interval)
+
+
 def _get_scanner(rules):
     """One yara-x Scanner per worker thread (Scanner is not thread-safe;
     Rules is). Reused across submissions so we don't pay Scanner init per file."""
@@ -759,44 +796,42 @@ if __name__ == '__main__':
     # Scan jobs. Each worker thread lazily creates one yx.Scanner (thread-local)
     # and reuses it across scans -- yara-x Scanners are single-threaded but
     # cheap to create once per thread.
-    start = time()
-    bytes_scanned = 0
-    match_count = 0
-    files_scanned = 0
+    progress = Progress(scan_size)
     results = []
     is_tty_stderr = sys.stderr.isatty()
 
-    def _report_progress():
-        elapsed = time() - start
-        if elapsed <= 0 or bytes_scanned == 0:
-            eta = 'N/A'
-        else:
-            bps = bytes_scanned / elapsed
-            eta = str(datetime.timedelta(seconds=int((scan_size - bytes_scanned) / bps)))
-        sys.stderr.write('\r\x1b[K' + 'Progress: (%s/%s)\tETA: %s\tMatches: %d' % (
-            human_size(bytes_scanned), human_size(scan_size), eta, match_count))
-        sys.stderr.flush()
+    # Ticker thread for real-time progress. Only started when -p is set and
+    # stderr is a tty -- piped/captured runs get no ticker output.
+    stop_ticker = threading.Event()
+    ticker_thread = None
+    if options.performance and is_tty_stderr:
+        ticker_thread = threading.Thread(
+            target=_progress_ticker, args=(progress, stop_ticker), daemon=True)
+        ticker_thread.start()
 
     try:
         with ThreadPoolExecutor(max_workers=options.num_threads) as ex:
             futures = [ex.submit(scan_one, compiled_rules, f, sz) for f, sz in jobs]
             for fut in as_completed(futures):
                 fname, size, matches, err = fut.result()
-                bytes_scanned += size
-                files_scanned += 1
+                progress.bytes_scanned += size
+                progress.files_scanned += 1
                 if err is not None:
                     print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
                     continue
                 if matches:
-                    match_count += 1
+                    progress.match_count += 1
                     results.append({'matches': matches, 'fname': fname})
                 elif options.negative:
                     results.append({'matches': [], 'fname': fname})
-                if options.performance and is_tty_stderr:
-                    _report_progress()
     except KeyboardInterrupt:
         print('\nInterrupted; outputting results collected so far')
+    finally:
+        stop_ticker.set()
+        if ticker_thread is not None:
+            ticker_thread.join(timeout=1.5)
     if options.performance and is_tty_stderr:
+        progress.render()
         sys.stderr.write('\n')
 
     if options.json:
@@ -873,5 +908,7 @@ if __name__ == '__main__':
                     print()
     
     if options.performance:
-        elapsed = time() - start
-        print('[*]\tProcessed %s files in %s seconds. %s/s' % (files_scanned,round(elapsed,2), human_size(bytes_scanned/elapsed)))
+        elapsed = time() - progress.start
+        rate = human_size(progress.bytes_scanned / elapsed) if elapsed > 0 else 'N/A'
+        print('[*]\tProcessed %s files in %s seconds. %s/s' % (
+            progress.files_scanned, round(elapsed, 2), rate))
