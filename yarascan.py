@@ -14,7 +14,7 @@ from utils import recursive_all_files
 from time import sleep, time
 from argparse import ArgumentParser
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 from hashlib import md5
 from pprint import pprint
@@ -340,9 +340,6 @@ def run_profile_via_cli(rule_files, scan_targets, threshold):
 
 
 
-_thread_local = threading.local()
-
-
 class Progress:
     """Live scan progress. Read by a ticker thread, written by the main
     completion loop. All fields are ints so += on a single writer thread is
@@ -380,22 +377,45 @@ def _progress_ticker(progress, stop_event, interval=1.0):
         stop_event.wait(interval)
 
 
-def _get_scanner(rules):
-    """One yara-x Scanner per worker thread (Scanner is not thread-safe;
-    Rules is). Reused across submissions so we don't pay Scanner init per file."""
-    s = getattr(_thread_local, 'scanner', None)
-    if s is None:
-        s = yx.Scanner(rules)
-        _thread_local.scanner = s
-    return s
+# Per-worker-process state. Set up by _worker_init when a worker starts,
+# then read by _worker_scan_one on each task. Kept as module globals so we
+# don't have to ship Rules through the pickle path.
+_worker_scanner = None
+_worker_rule_filter = None
+
+
+def _worker_init(yxc_path, worker_rule_filter):
+    """Initialize a worker process. Called once when the worker starts.
+    Loads the serialized rules from disk (one deserialize per process,
+    reused across every scan the worker runs). yara-x's Scanner is
+    single-threaded but each worker process only runs one scan at a time,
+    so a per-process global Scanner is safe."""
+    global _worker_scanner, _worker_rule_filter
+    with open(yxc_path, 'rb') as fp:
+        rules = yx.Rules.deserialize_from(fp)
+    _worker_scanner = yx.Scanner(rules)
+    _worker_rule_filter = worker_rule_filter
+
+
+def _worker_scan_one(fname, size):
+    """Run one scan in a worker process. Uses the per-process globals set
+    by _worker_init. Returns (fname, size, matches_or_None, error_string_or_None)."""
+    try:
+        results = _worker_scanner.scan_file(fname)
+        matches = [MatchShim(r) for r in results.matching_rules]
+        matches = [m for m in matches
+                   if not filter_match(m, fname, rule_filter=_worker_rule_filter)]
+        return fname, size, matches, None
+    except Exception as e:
+        return fname, size, None, str(e)
 
 
 def scan_one(rules, fname, size):
-    """Scan a single file. Returns (fname, size, matches_or_None, error_or_None)."""
+    """Thread-mode fallback (kept for single-file quick scans / debugging)."""
     try:
-        scanner = _get_scanner(rules)
-        scan_results = scanner.scan_file(fname)
-        matches = [MatchShim(r) for r in scan_results.matching_rules]
+        scanner = yx.Scanner(rules)
+        results = scanner.scan_file(fname)
+        matches = [MatchShim(r) for r in results.matching_rules]
         matches = [m for m in matches if not filter_match(m, fname)]
         return fname, size, matches, None
     except Exception as e:
@@ -416,7 +436,10 @@ def human_size(nbytes):
     f = ('%s' % float('%.3g' % nbytes)).rstrip('0').rstrip('.')
     return '%s %s' % (f, suffixes[i])
 
-def filter_match(match, fname):
+def filter_match(match, fname, rule_filter=None):
+    if rule_filter is None:
+        # Fall back to the module-level default (main-block scenario).
+        rule_filter = globals().get('rule_filter', {})
     try:
         # Per-source rule filter from '-S path::rule_name[,rule_name...]'.
         if rule_filter:
@@ -518,8 +541,9 @@ def build_rules(parsed_signatures):
     So we do a single pass with per-file try/except rather than a
     test_compile step + batch compile.
 
-    Returns (compiled_rules, rule_filter) so callers can thread rule_filter
-    through explicitly rather than relying on a module-level global.
+    Returns (compiled_rules, rule_filter, yxc_path). yxc_path is on-disk
+    so worker processes in a ProcessPoolExecutor can deserialize it
+    without shipping a Rules object through pickle.
     """
     file_list, this_rule_filter = collect_rule_files(parsed_signatures)
     _hash = rules_hash(file_list)
@@ -527,7 +551,7 @@ def build_rules(parsed_signatures):
     if os.path.isfile(path):
         print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
         with open(path, 'rb') as fp:
-            return yx.Rules.deserialize_from(fp), this_rule_filter
+            return yx.Rules.deserialize_from(fp), this_rule_filter, path
 
     start = time()
     c = yx.Compiler(relaxed_re_syntax=True)
@@ -560,7 +584,7 @@ def build_rules(parsed_signatures):
     if options.performance:
         print('[*]\tCompiled %s / %s rule files in %s seconds.' % (ok, len(file_list), round(elapsed,2)))
         print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
-    return compiled_rules, this_rule_filter
+    return compiled_rules, this_rule_filter, path
 
 def offset_to_line(fname, offset, match_len):
     size = os.stat(fname).st_size
@@ -780,15 +804,15 @@ if __name__ == '__main__':
     elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]) \
             and options.parsed_signatures[0][0].endswith('.yxc'):
         # Precompiled yara-x rules fast path
-        path, names = options.parsed_signatures[0]
+        yxc_path, names = options.parsed_signatures[0]
         try:
-            with open(path, 'rb') as fp:
+            with open(yxc_path, 'rb') as fp:
                 compiled_rules = yx.Rules.deserialize_from(fp)
             rule_filter = {'*': names} if names else {}
         except Exception:
-            compiled_rules, rule_filter = build_rules(options.parsed_signatures)
+            compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
     else:
-        compiled_rules, rule_filter = build_rules(options.parsed_signatures)
+        compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
 
     if options.categorize_dir:
         os.makedirs(options.categorize_dir, exist_ok=True)
@@ -809,9 +833,17 @@ if __name__ == '__main__':
             target=_progress_ticker, args=(progress, stop_ticker), daemon=True)
         ticker_thread.start()
 
+    # yara-x's Python binding does not release the GIL during scan_file, so
+    # threading serializes at ~100% single-thread CPU. We use processes to
+    # get real parallelism -- each worker deserializes the .yxc once at
+    # startup and reuses the same Scanner for every scan it runs.
     try:
-        with ThreadPoolExecutor(max_workers=options.num_threads) as ex:
-            futures = [ex.submit(scan_one, compiled_rules, f, sz) for f, sz in jobs]
+        with ProcessPoolExecutor(
+            max_workers=options.num_threads,
+            initializer=_worker_init,
+            initargs=(yxc_path, rule_filter),
+        ) as ex:
+            futures = [ex.submit(_worker_scan_one, f, sz) for f, sz in jobs]
             for fut in as_completed(futures):
                 fname, size, matches, err = fut.result()
                 progress.bytes_scanned += size
