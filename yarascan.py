@@ -39,14 +39,16 @@ def build_arg_parser():
              "scanning to those rules from that source. Repeat -S to combine "
              "multiple sources.")
     p.add_argument('-T', '--Threshold', dest='threshold', type=float, default=3.0,
-        help="threshold used in profiling to determine if a rule's runtime "
-             "is abnormal. Default=3, which returns any rules taking 3x "
-             "longer than average or 1/3x or less of average")
+        help="minimum %%-of-mean cost for a rule or pattern to appear in "
+             "the -P output. Default=3.0 (i.e. >=300%% of the mean).")
+    p.add_argument('-N', '--top', dest='top_n', type=int, default=5,
+        help='cap on rows per table in -P output. Default=5. Use 0 for uncapped.')
     p.add_argument('-p', '--performance', action='store_true', default=False,
         help='Enable progress and performance profiling')
     p.add_argument('-P', '--Profile', dest='profile', action='store_true', default=False,
-        help='Profile rules searching for performance issues, overlapping '
-             'detection, and error 30')
+        help='Native yara-x profiler. Prints per-rule and per-pattern cost '
+             'tables. Requires yara-x built with the rules-profiling feature '
+             '(see README).')
     p.add_argument('-s', '--strings', action='store_true', default=False,
         help='output matching strings')
     p.add_argument('-C', '--categorize', dest='categorize_dir', default=False,
@@ -187,37 +189,86 @@ def rules_hash(file_list):
     return h.hexdigest()
 
 
-# Path to a separately-built yara CLI compiled with --enable-profiling.
-# yara-python 4.5.x's profiling_info() is broken against current libyara
-# (issue VirusTotal/yara-python#155), so -P shells out to this binary.
-# Build instructions live in the README. Falls back to a notice if missing.
-PROFILED_YARA_BIN = os.path.expanduser(
-    '~/tools/yara-scanner/yara-profiling/bin/yara')
+def _humanize_time(sec):
+    """Format a seconds float compactly. 0.0012 -> '1.2ms', 3.5 -> '3.5s'."""
+    if sec >= 1.0:
+        return '%.2fs' % sec
+    if sec >= 0.001:
+        return '%.1fms' % (sec * 1000)
+    if sec >= 1e-6:
+        return '%.1fus' % (sec * 1e6)
+    return '%.0fns' % (sec * 1e9)
 
 
-def run_profile_via_cli(rule_files, scan_targets, threshold):
-    """Run the profiled yara CLI against scan_targets and report per-rule outliers.
+def _profile_supported():
+    """Probe whether yara-x was built with the rules-profiling feature.
 
-    rule_files    : list of source .yar rule file paths, or (namespace, path) pairs.
-                    Passed as positional [ns:]path args to the CLI. Compiled
-                    format is not portable between yara-python/yara-x and the
-                    standalone CLI, so we always feed source files.
-    scan_targets  : positional list of files/dirs from argv. Dirs are expanded.
-    threshold     : -T value. Rule is flagged if cost/mean_cost > threshold.
+    yara_x.Scanner.slowest_rules raises RuntimeError with a build hint
+    when the feature is off. We build a trivial scanner + call the method
+    once at startup so the -P branch can fall back cleanly."""
+    try:
+        c = yx.Compiler()
+        c.add_source('rule _yx_probe { condition: true }')
+        yx.Scanner(c.build()).slowest_rules(0)
+        return True
+    except Exception:
+        return False
+
+
+def _collect_compile_warnings(parsed_signatures):
+    """Compile each rule source with a fresh Compiler and collect its structured
+    warnings. Returned as a dict keyed by (rule_name, pattern_ident) so we can
+    annotate the profile table with per-pattern signals.
+
+    Note: this is a *second* compile pass on top of build_rules(). It's cheap
+    (yara-x compile is fast) and only runs under -P. Kept separate so we
+    don't have to change build_rules' return signature."""
+    warns = {}   # (rule, pattern) -> list[str]
+    for path, _names in parsed_signatures:
+        if os.path.isdir(path):
+            candidates = recursive_all_files(path, 'yar')
+        elif os.path.isfile(path):
+            candidates = [path]
+        else:
+            continue
+        for rulefile in candidates:
+            try:
+                c = yx.Compiler(relaxed_re_syntax=True)
+                c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
+                c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
+                with open(rulefile) as fp:
+                    c.add_source(fp.read(), origin=rulefile)
+                c.build()
+                for w in c.warnings():
+                    # Text form looks like: "warning[slow_pattern]: ..."
+                    # We match on the code and pull rule + pattern out of
+                    # the location context. yara-x's warnings API is
+                    # structured but somewhat opaque; parse conservatively.
+                    text = str(w)
+                    if 'slow_pattern' not in text:
+                        continue
+                    # yara-x embeds "rule <name>" and "$<pattern>" tokens
+                    # in the rendered warning; grep them.
+                    rm = re.search(r'rule\s+"([^"]+)"', text)
+                    pm = re.search(r'string\s+"(\$[^"]+)"', text)
+                    if rm and pm:
+                        warns.setdefault((rm.group(1), pm.group(1)), []).append('may-slow')
+            except Exception:
+                # Compile errors are already surfaced by build_rules; ignore here.
+                pass
+    return warns
+
+
+def run_profile_native(compiled_rules, scan_targets, options, warnings_by_pattern):
+    """Native profiler using yara-x's Scanner.slowest_rules / slowest_patterns.
+
+    Runs single-process so all profiling accumulates in one Scanner. -P is a
+    diagnostic mode, not the hot path, so the parallelism trade-off is fine.
+
+    Also captures per-(rule, pattern) match counts so we can annotate patterns
+    that hit yara-x's 1M-per-pattern silent match cap ("firehose" signal).
     """
-    import subprocess
-
-    if not os.path.exists(PROFILED_YARA_BIN):
-        print('[!]\tProfiled yara CLI not found at %s' % PROFILED_YARA_BIN)
-        print('[!]\tBuild it with `./configure --enable-profiling '
-              '--prefix=~/tools/yara-scanner/yara-profiling && make install` '
-              '(see README). Skipping -P.')
-        return
-
-    # Expand dirs into a flat file list. The CLI only emits profiling output
-    # when invoked against a single file (its directory-scan branch uses
-    # multiple scanner threads and skips the profiling print). So we iterate
-    # in Python and accumulate per-rule costs across invocations.
+    # Expand target dirs into files
     flat_files = []
     for t in scan_targets:
         if os.path.isdir(t):
@@ -228,115 +279,118 @@ def run_profile_via_cli(rule_files, scan_targets, threshold):
         print('[!]\tNo files to scan after expanding targets: %s' % scan_targets)
         return
 
-    # Build the [ns:]path positional args. Namespace defaults to file basename
-    # without extension (same convention as compile_rule/build_rules).
-    rule_args = []
-    for entry in rule_files:
-        if isinstance(entry, tuple):
-            ns, path = entry
-        else:
-            ns = os.path.splitext(os.path.basename(entry))[0]
-            path = entry
-        rule_args.append('%s:%s' % (ns, path))
+    threshold = options.threshold
+    top_n = options.top_n
+    # yara-x silently caps matches per pattern at 1,000,000 -- callers
+    # should treat "at or near the cap" as a firehose signal.
+    MATCH_CAP = 1_000_000
 
+    scanner = yx.Scanner(compiled_rules)
+    match_counts = {}   # (rule, pattern) -> total match count summed across files
+    per_file_cost = {}  # fname -> wall time to scan this file
+
+    from time import perf_counter
     is_tty = sys.stderr.isatty()
     profile_start = time()
-    try:
-        block_re = re.compile(r'^\s*(\d+)\s+(\S+):(\S+):\s*$')
-        results = {}  # accumulator: <ns>::<rule> -> summed cost
-        per_file_cost = {}  # fname -> total cost summed across rules
-        for i, fname in enumerate(flat_files, 1):
-            try:
-                proc = subprocess.run(
-                    [PROFILED_YARA_BIN, '-w'] + rule_args + [fname],
-                    capture_output=True, text=True, errors='replace')
-            except Exception as e:
-                print('[!]\tFailed scanning %s: %s' % (fname, e))
-                continue
-            in_block = False
-            file_cost = 0
-            for line in proc.stdout.splitlines():
-                if 'PROFILING INFORMATION' in line:
-                    in_block = True
-                    continue
-                if in_block and line.startswith('=='):
-                    in_block = False
-                    continue
-                if not in_block:
-                    continue
-                m = block_re.match(line)
-                if m:
-                    cost = int(m.group(1))
-                    key = '%s::%s' % (m.group(2), m.group(3))
-                    results[key] = results.get(key, 0) + cost
-                    file_cost += cost
-            per_file_cost[fname] = file_cost
-            # Progress: only rewrite on TTY; otherwise print sparsely so
-            # piped/captured output stays readable.
-            if is_tty:
-                sys.stderr.write('\rprofiled %d/%d files' % (i, len(flat_files)))
-                sys.stderr.flush()
-            elif i % 50 == 0 or i == len(flat_files):
-                sys.stderr.write('profiled %d/%d files\n' % (i, len(flat_files)))
+    for i, fname in enumerate(flat_files, 1):
+        t0 = perf_counter()
+        try:
+            results = scanner.scan_file(fname)
+        except Exception as e:
+            print('[!]\tFailed scanning %s: %s' % (fname, e))
+            continue
+        per_file_cost[fname] = perf_counter() - t0
+        # Match-count accumulation for the "capped/firehose" note
+        for r in results.matching_rules:
+            for p in r.patterns:
+                key = (r.identifier, p.identifier)
+                match_counts[key] = match_counts.get(key, 0) + len(p.matches)
+        # Progress line
         if is_tty:
-            sys.stderr.write('\n')
-        profile_elapsed = time() - profile_start
+            sys.stderr.write('\rprofiled %d/%d files' % (i, len(flat_files)))
+            sys.stderr.flush()
+        elif i % 50 == 0 or i == len(flat_files):
+            sys.stderr.write('profiled %d/%d files\n' % (i, len(flat_files)))
+    if is_tty:
+        sys.stderr.write('\n')
+    wallclock = time() - profile_start
 
-        if not results:
-            print('[!]\tNo profiling info captured. CLI exit=%s' % proc.returncode)
-            tail = '\n'.join(proc.stdout.splitlines()[-20:])
-            if proc.stderr.strip():
-                print('--- stderr (tail) ---\n%s' % '\n'.join(
-                    proc.stderr.splitlines()[-20:]))
-            if tail:
-                print('--- stdout (tail) ---\n%s' % tail)
-            return
+    # Get profiling data. Ask for a big N so filtering happens here in Python
+    # rather than in the Rust cutoff.
+    slowest_rules = scanner.slowest_rules(1000)
+    slowest_patterns = scanner.slowest_patterns(1000)
 
-        # Mean of non-zero costs (zero-cost rules dominate the count when only
-        # a few rules actually fired; including them yields a tiny mean that
-        # makes every non-trivial rule look like an "outlier").
-        nonzero = [c for c in results.values() if c > 0]
-        if not nonzero:
-            print('[!]\tAll rules profiled at cost=0. Nothing to compare.')
-            return
-        mean_cost = sum(nonzero) / len(nonzero)
+    # ---- Rules table --------------------------------------------------------
+    total_rule_time = sum(r['condition_exec_time'] + r['pattern_matching_time']
+                          for r in slowest_rules)
+    mean_rule = (total_rule_time / len(slowest_rules)) if slowest_rules else 0
+    # yara-x's slowest_rules has a hardcoded 100ms floor at the Rust layer;
+    # rules cheaper than that aren't returned regardless of the -N cap. We
+    # surface that in the header so users understand why the rules table
+    # sometimes has fewer rows than the patterns table.
+    print('===== yarascan -P (%d files, wallclock %.1fs, %d rules >=100ms) =====\n'
+          % (len(flat_files), wallclock, len(slowest_rules)))
+    print('Rules (mean total cost %s, threshold >=%.0f%% of mean):'
+          % (_humanize_time(mean_rule), threshold * 100))
+    print('    %-10s %-6s  %-56s  notes' % ('cost', '%mean', 'rule'))
+    n_shown = 0
+    for r in slowest_rules:
+        if top_n and n_shown >= top_n:
+            break
+        total = r['condition_exec_time'] + r['pattern_matching_time']
+        pct = (total / mean_rule) if mean_rule else 0
+        if pct < threshold:
+            break  # sorted descending, so we can stop scanning
+        notes = []
+        if r['condition_exec_time'] > 0.001:
+            notes.append('condition %s' % _humanize_time(r['condition_exec_time']))
+        rule_full = '%s::%s' % (r['namespace'], r['rule'])
+        print('    %-10s %5.0f%%  %-56s  %s'
+              % (_humanize_time(total), pct * 100, rule_full[:56], ' '.join(notes)))
+        n_shown += 1
+    if n_shown == 0:
+        print('    (nothing above threshold)')
+    print()
 
-        # Only flag SLOW outliers. The "fast outlier" check from the legacy
-        # implementation flooded the output with rules at cost=1-10 (rules
-        # whose atoms matched once or twice but the condition didn't fire)
-        # because the mean is heavily skewed by a handful of very-expensive
-        # rules. Symmetric-around-mean thresholding doesn't survive that
-        # skew, and slow outliers are what we actually want to find.
-        outliers = []
-        for key, cost in results.items():
-            if cost == 0:
-                continue
-            relative = cost / mean_cost
-            if relative > threshold:
-                outliers.append((relative, key, cost))
-        outliers.sort(reverse=True)
+    # ---- Patterns table -----------------------------------------------------
+    total_pat_time = sum(p['matching_time'] for p in slowest_patterns)
+    mean_pat = (total_pat_time / len(slowest_patterns)) if slowest_patterns else 0
+    print('Patterns (mean matching time %s, threshold >=%.0f%% of mean):'
+          % (_humanize_time(mean_pat), threshold * 100))
+    print('    %-10s %-6s  %-56s  notes' % ('cost', '%mean', 'rule::pattern'))
+    n_shown = 0
+    for p in slowest_patterns:
+        if top_n and n_shown >= top_n:
+            break
+        pct = (p['matching_time'] / mean_pat) if mean_pat else 0
+        if pct < threshold:
+            break
+        notes = []
+        # Compile-time warning?
+        if (p['rule'], p['pattern']) in warnings_by_pattern:
+            notes.extend(warnings_by_pattern[(p['rule'], p['pattern'])])
+        # Firehose / cap-hit?
+        mc = match_counts.get((p['rule'], p['pattern']), 0)
+        if mc >= MATCH_CAP:
+            notes.append('capped @%dM matches' % (mc // 1_000_000))
+        elif mc >= 100_000:
+            notes.append('%d matches' % mc)
+        full = '%s::%s::%s' % (p['namespace'], p['rule'], p['pattern'])
+        print('    %-10s %5.0f%%  %-56s  %s'
+              % (_humanize_time(p['matching_time']), pct * 100,
+                 full[:56], ' '.join(notes)))
+        n_shown += 1
+    if n_shown == 0:
+        print('    (nothing above threshold)')
+    print()
 
-        print('===== yarascan -P: per-rule outliers '
-              '(threshold=%g, mean nonzero cost=%.0f, n_rules=%d, '
-              'files=%d, profile-wallclock=%.1fs) ====='
-              % (threshold, mean_cost, len(results), len(flat_files),
-                 profile_elapsed))
-        for relative, key, cost in outliers:
-            print('{0:60}\t{1:>14}\t{2:>8.1f}%'.format(key, cost,
-                                                       relative * 100.0))
-        if not outliers:
-            print('(no outliers above threshold)')
-
-        # Top files by total cost -- useful for "which file is making the
-        # corpus expensive?" pivoting after rule-level results.
-        if per_file_cost:
-            top_files = sorted(per_file_cost.items(), key=lambda kv: -kv[1])[:5]
-            print('\n--- top 5 files by total cost ---')
-            for fname, c in top_files:
-                if c > 0:
-                    print('{0:>14}\t{1}'.format(c, fname))
-    except Exception as e:
-        print('[!]\tprofile invocation failed: %s' % e)
+    # ---- Top files by cost --------------------------------------------------
+    if per_file_cost:
+        top_files = sorted(per_file_cost.items(), key=lambda kv: -kv[1])[:5]
+        print('--- top 5 files by wall time ---')
+        for fname, c in top_files:
+            if c > 0:
+                print('    %-10s %s' % (_humanize_time(c), fname))
 
 
 
@@ -794,12 +848,19 @@ if __name__ == '__main__':
             jobs.append((f, size))
             scan_size += size
 
-    # -P short-circuits: shells out to the profiled yara CLI with the source
-    # rule files as [ns:]path positional args. Compiled-rules format is not
-    # portable between yara-x's Rules and the standalone CLI's .cyar.
+    # -P uses yara-x's native profiling API (Scanner.slowest_rules /
+    # slowest_patterns). Requires a wheel built with `maturin build
+    # --features rules-profiling`; see README.
     if options.profile:
-        rule_files, rule_filter = collect_rule_files(options.parsed_signatures)
-        run_profile_via_cli(rule_files, args, options.threshold)
+        if not _profile_supported():
+            print('[!]\tThis yara-x wheel was built without the rules-profiling feature.')
+            print('[!]\tBuild the profiling-enabled wheel:')
+            print('[!]\t    cd ~/tools/yara-x/py && maturin build --release --features rules-profiling')
+            print('[!]\t    pip install --user --force-reinstall --no-deps ../target/wheels/yara_x-*.whl')
+            sys.exit(1)
+        compiled_rules, rule_filter, _yxc = build_rules(options.parsed_signatures)
+        warnings_by_pattern = _collect_compile_warnings(options.parsed_signatures)
+        run_profile_native(compiled_rules, args, options, warnings_by_pattern)
         sys.exit(0)
     elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]) \
             and options.parsed_signatures[0][0].endswith('.yxc'):
