@@ -812,6 +812,11 @@ if __name__ == '__main__':
             if not res['matches'] and not options.negative:
                 continue
             header = False
+            # With -n, always emit the filename for no-match files so they can
+            # be picked up in "which files had zero hits" surveys.
+            if not res['matches'] and options.negative:
+                print(res['fname'])
+                continue
 
             for matchobj in res['matches']:
                 if not filter_match(matchobj, res['fname']):
