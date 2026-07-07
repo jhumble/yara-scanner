@@ -12,7 +12,7 @@ import json
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from utils import recursive_all_files
 from time import sleep, time
-from optparse import OptionParser
+from argparse import ArgumentParser
 from threading import Thread, Lock, current_thread
 from queue import Queue
 from multiprocessing import Pool, cpu_count
@@ -20,46 +20,65 @@ from hashlib import md5
 from pprint import pprint
 
 
+DEFAULT_RULES_DIR = '/home/jhumble/RE/ice-53-yara-rules/'
 
-usage = "yarascan.py [-S SIG[::RULE[,RULE...]]] [-t] [FILE_OR_DIR]..."
-opt_parser = OptionParser(usage=usage)
-opt_parser.add_option("-S", "--signatures", action="append",dest="signatures",
-    default=None, help="compiled .cyar file, .yar file, or directory of YARA rules. Append '::rule_name' (optionally comma-separated) to restrict scanning to those rules from that source. Repeat -S to combine multiple sources.")
-opt_parser.add_option("-T", "--Threshold", action="store",dest="threshold",default=3.0,type=float,
-   help="threshold used in profiling to determine if a rule's runtime is abnormal. Default=3, which returns any rules taking 3x longer than average or 1/3x or less of average")
-opt_parser.add_option("-p", "--performance", action="store_true",dest="performance",
-    default=False, help="Enable progress and performance profiling")
-opt_parser.add_option("-P", "--Profile", action="store_true",dest="profile",
-    default=False, help="Profile rules searching for performance issues, overlapping detection, and error 30")
-opt_parser.add_option("-s", "--strings", action="store_true",dest="strings",
-    default=False, help="output matching strings")
-opt_parser.add_option("-C", "--categorize", action="store",dest="categorize_dir",
-    default=False, help="categorize the scanned samples into directories by rule name")
-opt_parser.add_option("-o", "--offset", action="store_true",dest="offset",
-    default=False, help="show match string offsets")
-opt_parser.add_option("-t", "--threads", type=int, action="store",dest="num_threads",
-    default=None, help="number of threads/workers")
-opt_parser.add_option("-c", "--context", type=int, action="store",dest="context",
-    default=5, help="number of bytes of context before and after matches")
-opt_parser.add_option("-l", "--line", action="store_true",dest="line",
-    default=False, help="Output entire line match occurs on")
-opt_parser.add_option("-j", "--json", action="store",dest="json",
-    default=False, help="json output")
-opt_parser.add_option("-n", "--negative", action="store_true",dest="negative",
-    default=False, help="Output files having no matches")
-opt_parser.add_option("-w", "--wide", action="store_true",dest="wide",
-    default=False, help="Mark matching wide/utf-16le strings")
-opt_parser.add_option("--max-strings", action="store",dest="max_strings",type=int,
-    default=5, help="Max strings to print per rule")
-opt_parser.add_option("--max-offsets", action="store",dest="max_offsets",type=int,
-    default=5, help="Max offsets to print per string")
-opt_parser.add_option('-d', "--disassemble", action="store", choices=['64', '32'], default=None,
-    help="Disassemble matching bytes using 32/64 bit mode as provided")
 
-(options, args) = opt_parser.parse_args()
+def build_arg_parser():
+    """Build the CLI argument parser. Kept in a helper so tests / other
+    entry points can grab it without side effects."""
+    p = ArgumentParser(
+        prog='yarascan.py',
+        usage='yarascan.py [-S SIG[::RULE[,RULE...]]] [OPTIONS] [FILE_OR_DIR]...',
+        description='YARA scanner wrapper with cached compile, grep-like output, and profiling.',
+    )
+    p.add_argument('paths', nargs='*', metavar='FILE_OR_DIR',
+        help='files or directories to scan (recursed)')
+    p.add_argument('-S', '--signatures', action='append', default=None,
+        help="compiled .cyar file, .yar file, or directory of YARA rules. "
+             "Append '::rule_name' (optionally comma-separated) to restrict "
+             "scanning to those rules from that source. Repeat -S to combine "
+             "multiple sources.")
+    p.add_argument('-T', '--Threshold', dest='threshold', type=float, default=3.0,
+        help="threshold used in profiling to determine if a rule's runtime "
+             "is abnormal. Default=3, which returns any rules taking 3x "
+             "longer than average or 1/3x or less of average")
+    p.add_argument('-p', '--performance', action='store_true', default=False,
+        help='Enable progress and performance profiling')
+    p.add_argument('-P', '--Profile', dest='profile', action='store_true', default=False,
+        help='Profile rules searching for performance issues, overlapping '
+             'detection, and error 30')
+    p.add_argument('-s', '--strings', action='store_true', default=False,
+        help='output matching strings')
+    p.add_argument('-C', '--categorize', dest='categorize_dir', default=False,
+        help='categorize the scanned samples into directories by rule name')
+    p.add_argument('-o', '--offset', action='store_true', default=False,
+        help='show match string offsets')
+    p.add_argument('-t', '--threads', dest='num_threads', type=int, default=None,
+        help='number of threads/workers')
+    p.add_argument('-c', '--context', type=int, default=5,
+        help='number of bytes of context before and after matches')
+    p.add_argument('-l', '--line', action='store_true', default=False,
+        help='Output entire line match occurs on')
+    p.add_argument('-j', '--json', default=False,
+        help='json output file')
+    p.add_argument('-n', '--negative', action='store_true', default=False,
+        help='Output files having no matches')
+    p.add_argument('-w', '--wide', action='store_true', default=False,
+        help='Mark matching wide/utf-16le strings')
+    p.add_argument('--max-strings', dest='max_strings', type=int, default=5,
+        help='Max strings to print per rule')
+    p.add_argument('--max-offsets', dest='max_offsets', type=int, default=5,
+        help='Max offsets to print per string')
+    p.add_argument('-d', '--disassemble', choices=['64', '32'], default=None,
+        help='Disassemble matching bytes using 32/64 bit mode as provided')
+    return p
+
+
+options = build_arg_parser().parse_args()
+args = options.paths  # positional target files/dirs (was args from optparse)
 options.user_provided_signatures = options.signatures is not None
 if not options.signatures:
-    options.signatures = ['/home/jhumble/RE/ice-53-yara-rules/']
+    options.signatures = [DEFAULT_RULES_DIR]
 
 # Parse optional '::rule1,rule2' suffix per -S to restrict which rules fire from that source.
 options.parsed_signatures = []
