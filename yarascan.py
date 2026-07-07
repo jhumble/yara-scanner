@@ -13,9 +13,9 @@ sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from utils import recursive_all_files
 from time import sleep, time
 from argparse import ArgumentParser
-from threading import Thread, Lock, current_thread
-from queue import Queue
-from multiprocessing import Pool, cpu_count
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from hashlib import md5
 from pprint import pprint
 
@@ -340,40 +340,31 @@ def run_profile_via_cli(rule_files, scan_targets, threshold):
 
 
 
-def worker():
-    global TERMINATE_EARLY
-    global result_queue
-    global bytes_scanned
-    global files_scanned
-    global match_count
-    global lock
+_thread_local = threading.local()
 
-    # yara-x Scanner is not thread-safe; give each worker its own.
-    scanner = yx.Scanner(compiled_rules)
-    while True:
-        if TERMINATE_EARLY:
-            return
-        job = scan_queue.get()
-        if job is None:
-            scan_queue.task_done()
-            return
-        try:
-            scan_results = scanner.scan_file(job['fname'])
-            matches = [MatchShim(r) for r in scan_results.matching_rules]
-            # filter out any matches that do not apply
-            matches = [m for m in matches if not filter_match(m, job['fname'])]
-            result_queue.put({'matches': matches, 'fname': job['fname']})
-            with lock:
-                if matches:
-                    match_count += 1
-                bytes_scanned += job['size']
-                files_scanned += 1
-        except Exception as e:
-            print('Exception scanning %s (%s): %s' % (job['fname'],human_size(job['size']),e))
-        scan_queue.task_done()
-    #print 'worker %s exiting' % (current_thread())
-    #return
-        
+
+def _get_scanner(rules):
+    """One yara-x Scanner per worker thread (Scanner is not thread-safe;
+    Rules is). Reused across submissions so we don't pay Scanner init per file."""
+    s = getattr(_thread_local, 'scanner', None)
+    if s is None:
+        s = yx.Scanner(rules)
+        _thread_local.scanner = s
+    return s
+
+
+def scan_one(rules, fname, size):
+    """Scan a single file. Returns (fname, size, matches_or_None, error_or_None)."""
+    try:
+        scanner = _get_scanner(rules)
+        scan_results = scanner.scan_file(fname)
+        matches = [MatchShim(r) for r in scan_results.matching_rules]
+        matches = [m for m in matches if not filter_match(m, fname)]
+        return fname, size, matches, None
+    except Exception as e:
+        return fname, size, None, e
+
+
 #catch ctrl-c (SIGINT) and exit
 def signal_handler(signal,frame):
     sys.exit(0)
@@ -448,65 +439,6 @@ def filter_match(match, fname):
 
 
 
-def monitor_thread(worker_threads):
-    start = time()
-    global scan_queue
-    global bytes_scanned
-    global result_queue
-    global scan_size
-    global scan_files
-    while True:
-        if TERMINATE_EARLY:
-            break
-        working = 0
-        for t in worker_threads:
-            if t.is_alive():
-                working += 1
-        delta = time() - start
-        #print 'completed = %s working = %s' % (completed,working)
-        try:
-            bytes_per_sec = bytes_scanned/delta*1.0
-            estimated_sec = (scan_size - bytes_scanned)/bytes_per_sec
-            estimated_time = str(datetime.timedelta(seconds=int(estimated_sec)))
-        except:
-            estimated_time = 'N/A'
-        sys.stderr.write('\r' + ' '*100)
-        sys.stderr.flush()
-        sys.stderr.write('\r')
-        sys.stderr.flush()
-        sys.stderr.write('Progress: (%s/%s)\t\tTime Remaining: %s\t\tMatches: %s' % (human_size(bytes_scanned), human_size(scan_size), estimated_time, match_count))
-        sys.stderr.flush()
-        if scan_queue.qsize() == 0 and working == 0:
-            break
-        sleep(1)
-    print('\n')
-    elapsed = time() - start
-
-def compile_rule(rulefile):
-    """Compile a single rule file with yara-x. Returns None if compilation fails."""
-    try:
-        key = os.path.splitext(os.path.split(rulefile)[1])[0]
-        c = yx.Compiler(relaxed_re_syntax=True)
-        c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
-        c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
-        c.new_namespace(key)
-        with open(rulefile) as fp:
-            c.add_source(fp.read(), origin=rulefile)
-        c.build()
-        return {'key': key, 'rulefile': rulefile}
-    except Exception as e:
-        print('rule %s failed to compile! Error: %s' % (rulefile, e))
-    return None
-
-def test_compile(file_list):
-    """Test-compile each rule in parallel; return {namespace: path} of survivors."""
-    rtn = {}
-    pool = Pool(options.num_threads)
-    for item in pool.map(compile_rule, file_list):
-        if item:
-            rtn[item['key']] = item['rulefile']
-    return rtn
-       
 def collect_rule_files(parsed_signatures):
     """Expand parsed -S entries into (file_list, rule_filter).
 
@@ -542,35 +474,42 @@ def collect_rule_files(parsed_signatures):
     return files, rf
 
 def build_rules(parsed_signatures):
-    """Compile all rule sources into a yara_x.Rules object, caching to /tmp/<content-hash>.yxc."""
-    global rule_filter
-    file_list, rule_filter = collect_rule_files(parsed_signatures)
+    """Compile all rule sources into a yara_x.Rules object, caching to /tmp/<content-hash>.yxc.
+
+    yara-x's Compiler tolerates errors: add_source() raises on the first
+    error in a source, but you can catch it and keep adding more sources.
+    So we do a single pass with per-file try/except rather than a
+    test_compile step + batch compile.
+
+    Returns (compiled_rules, rule_filter) so callers can thread rule_filter
+    through explicitly rather than relying on a module-level global.
+    """
+    file_list, this_rule_filter = collect_rule_files(parsed_signatures)
     _hash = rules_hash(file_list)
     path = os.path.join('/tmp/', '%s.yxc' % (_hash))
     if os.path.isfile(path):
         print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
         with open(path, 'rb') as fp:
-            return yx.Rules.deserialize_from(fp)
+            return yx.Rules.deserialize_from(fp), this_rule_filter
 
     start = time()
-    rulefile_paths = test_compile(file_list)
-    elapsed = time() - start
-    if options.performance:
-        print('[*]\tTest compiled %s rules in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
-
-    start = time()
-    compiled_rules = None
-    try:
-        c = yx.Compiler(relaxed_re_syntax=True)
-        c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
-        c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
-        for ns, rulefile in rulefile_paths.items():
-            c.new_namespace(ns)
+    c = yx.Compiler(relaxed_re_syntax=True)
+    c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
+    c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
+    ok = 0
+    for rulefile in file_list:
+        ns = os.path.splitext(os.path.basename(rulefile))[0]
+        c.new_namespace(ns)
+        try:
             with open(rulefile) as fp:
                 c.add_source(fp.read(), origin=rulefile)
+            ok += 1
+        except Exception as e:
+            print('rule %s failed to compile! Error: %s' % (rulefile, e))
+    try:
         compiled_rules = c.build()
     except Exception as e:
-        print('Exception compiling rules: %s' % (e))
+        print('Exception in Compiler.build(): %s' % e)
         raise
     elapsed = time() - start
     try:
@@ -582,9 +521,9 @@ def build_rules(parsed_signatures):
     compiled_size = os.stat(path).st_size
 
     if options.performance:
-        print('[*]\tCompiled %s rule files in %s seconds.' % (len(rulefile_paths), round(elapsed,2)))
+        print('[*]\tCompiled %s / %s rule files in %s seconds.' % (ok, len(file_list), round(elapsed,2)))
         print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
-    return compiled_rules
+    return compiled_rules, this_rule_filter
 
 def offset_to_line(fname, offset, match_len):
     size = os.stat(fname).st_size
@@ -773,49 +712,31 @@ def iterate_matches(patterns, fname):
 
 
 if __name__ == '__main__':
-    global TERMINATE_EARLY
-    global scan_queue
-    global result_queue
-    global bytes_scanned
-    global match_count
-    global scan_size
-    global scan_files
-    global lock
-    global files_scanned
-
-    lock = Lock()
-    files_scanned = 0
-    TERMINATE_EARLY = False
-    scan_queue = Queue()
-    result_queue = Queue()
-    bytes_scanned = 0
-    match_count = 0
-    scan_size = 0
     if options.disassemble:
         import r2pipe
 
     if options.performance:
         print('[*]\tScanning with %s threads.' % (options.num_threads))
 
+    # Collect scan targets and pre-compute total size for progress reporting.
     scanlist = []
     for arg in args:
         scanlist += recursive_all_files(arg)
-
-
-    #print 'scanning %s' % (scanlist)
+    jobs = []       # list of (fname, size)
     scan_size = 0
     for f in scanlist:
-        size = os.stat(f).st_size
+        try:
+            size = os.stat(f).st_size
+        except OSError:
+            continue
         if size != 0:
-            scan_size+= size
-            scan_queue.put({'fname': f, 'size': size})
-    scan_files = scan_queue.qsize()
+            jobs.append((f, size))
+            scan_size += size
 
+    # -P short-circuits: shells out to the profiled yara CLI with the source
+    # rule files as [ns:]path positional args. Compiled-rules format is not
+    # portable between yara-x's Rules and the standalone CLI's .cyar.
     if options.profile:
-        # -P subprocesses the profiled yara CLI (built with --enable-profiling).
-        # We pass source rule files directly since compiled-rules format is
-        # NOT portable between yara-x's Rules and the standalone yara CLI's
-        # .cyar. Cost attribution comes back as <namespace>:<rule_name>.
         rule_files, rule_filter = collect_rule_files(options.parsed_signatures)
         run_profile_via_cli(rule_files, args, options.threshold)
         sys.exit(0)
@@ -826,72 +747,68 @@ if __name__ == '__main__':
         try:
             with open(path, 'rb') as fp:
                 compiled_rules = yx.Rules.deserialize_from(fp)
-            if names:
-                rule_filter = {'*': names}
+            rule_filter = {'*': names} if names else {}
         except Exception:
-            compiled_rules = build_rules(options.parsed_signatures)
+            compiled_rules, rule_filter = build_rules(options.parsed_signatures)
     else:
-        compiled_rules = build_rules(options.parsed_signatures)
-
-    start = time()
-    complete = 0
-
-    worker_threads = []
-
-    for i in range(options.num_threads):
-        t = Thread(target=worker)
-        t.daemon = True #Die when main thread dies
-        t.start()
-        worker_threads.append(t)
-        scan_queue.put(None) # tells worker to exit
-
-    if options.performance:
-        monitor = Thread(target=monitor_thread,args=(worker_threads,))
-        monitor.daemon = True
-        monitor.start()
+        compiled_rules, rule_filter = build_rules(options.parsed_signatures)
 
     if options.categorize_dir:
         os.makedirs(options.categorize_dir, exist_ok=True)
 
-    while True:
-        try:
-            if scan_queue.empty():
-                break
-            else:
-                #print scan_queue.queue
-                sleep(1)
-        except KeyboardInterrupt as kbe:
-            TERMINATE_EARLY = True
-            #wait for workers to die
-            #for w in worker_threads:
-            #    w.join()
-            if options.performance:
-                monitor.join()
-            if result_queue.empty():
-                # we have 0 results, just exit
-                print('No results so far. Exiting')
-                exit()
-            else:
-                print('Stopping further processing and outputting results gathered so far')
-                sleep(1)
-            break
+    # Scan jobs. Each worker thread lazily creates one yx.Scanner (thread-local)
+    # and reuses it across scans -- yara-x Scanners are single-threaded but
+    # cheap to create once per thread.
+    start = time()
+    bytes_scanned = 0
+    match_count = 0
+    files_scanned = 0
+    results = []
+    is_tty_stderr = sys.stderr.isatty()
 
-    if options.performance:
-        monitor.join()
+    def _report_progress():
+        elapsed = time() - start
+        if elapsed <= 0 or bytes_scanned == 0:
+            eta = 'N/A'
+        else:
+            bps = bytes_scanned / elapsed
+            eta = str(datetime.timedelta(seconds=int((scan_size - bytes_scanned) / bps)))
+        sys.stderr.write('\r\x1b[K' + 'Progress: (%s/%s)\tETA: %s\tMatches: %d' % (
+            human_size(bytes_scanned), human_size(scan_size), eta, match_count))
+        sys.stderr.flush()
+
+    try:
+        with ThreadPoolExecutor(max_workers=options.num_threads) as ex:
+            futures = [ex.submit(scan_one, compiled_rules, f, sz) for f, sz in jobs]
+            for fut in as_completed(futures):
+                fname, size, matches, err = fut.result()
+                bytes_scanned += size
+                files_scanned += 1
+                if err is not None:
+                    print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
+                    continue
+                if matches:
+                    match_count += 1
+                    results.append({'matches': matches, 'fname': fname})
+                elif options.negative:
+                    results.append({'matches': [], 'fname': fname})
+                if options.performance and is_tty_stderr:
+                    _report_progress()
+    except KeyboardInterrupt:
+        print('\nInterrupted; outputting results collected so far')
+    if options.performance and is_tty_stderr:
+        sys.stderr.write('\n')
+
     if options.json:
-        results = {}
-        while not result_queue.empty():
-            res = result_queue.get()
-            matches = {}
-            for match in res['matches']:
-                matches[match.rule] = match.meta
-            if matches:
-                results[res['fname']] = matches
+        json_results = {}
+        for res in results:
+            match_map = {m.rule: m.meta for m in res['matches']}
+            if match_map:
+                json_results[res['fname']] = match_map
         with open(options.json, 'w') as fp:
-            json.dump(results, fp)
+            json.dump(json_results, fp)
     else:
-        while not result_queue.empty():
-            res = result_queue.get()
+        for res in results:
             if not res['matches'] and not options.negative:
                 continue
             header = False
