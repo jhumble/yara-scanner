@@ -120,7 +120,156 @@ def rules_hash(file_list):
     to_hash = ""
     for path in sorted(file_list):
         to_hash += '%s%s' % (os.path.basename(path),str(os.path.getmtime(path)))
-    return md5(to_hash.encode()).hexdigest() 
+    return md5(to_hash.encode()).hexdigest()
+
+
+# Path to a separately-built yara CLI compiled with --enable-profiling.
+# yara-python 4.5.x's profiling_info() is broken against current libyara
+# (issue VirusTotal/yara-python#155), so -P shells out to this binary.
+# Build instructions live in the README. Falls back to a notice if missing.
+PROFILED_YARA_BIN = os.path.expanduser(
+    '~/tools/yara-scanner/yara-profiling/bin/yara')
+
+
+def run_profile_via_cli(compiled_rules, scan_targets, threshold):
+    """Run the profiled yara CLI against scan_targets and report per-rule outliers.
+
+    compiled_rules : yara.Rules already-compiled by build_rules. Saved to a
+                     temp .cyar; the CLI loads it via -C.
+    scan_targets   : positional list of files/dirs from argv. -r is passed so
+                     dirs traverse recursively; files pass through fine.
+    threshold      : -T value. Rule is flagged if cost / mean_cost is above
+                     threshold or below 1/threshold.
+    """
+    import subprocess
+    import tempfile
+
+    if not os.path.exists(PROFILED_YARA_BIN):
+        print('[!]\tProfiled yara CLI not found at %s' % PROFILED_YARA_BIN)
+        print('[!]\tBuild it with `./configure --enable-profiling '
+              '--prefix=~/tools/yara-scanner/yara-profiling && make install` '
+              '(see README). Skipping -P.')
+        return
+
+    # Expand dirs into a flat file list. The CLI only emits profiling output
+    # when invoked against a single file (its directory-scan branch uses
+    # multiple scanner threads and skips the profiling print). So we iterate
+    # in Python and accumulate per-rule costs across invocations.
+    flat_files = []
+    for t in scan_targets:
+        if os.path.isdir(t):
+            flat_files.extend(recursive_all_files(t))
+        elif os.path.isfile(t):
+            flat_files.append(t)
+    if not flat_files:
+        print('[!]\tNo files to scan after expanding targets: %s' % scan_targets)
+        return
+
+    cyar = tempfile.NamedTemporaryFile(suffix='.cyar', delete=False).name
+    is_tty = sys.stderr.isatty()
+    profile_start = time()
+    try:
+        compiled_rules.save(cyar)
+        block_re = re.compile(r'^\s*(\d+)\s+(\S+):(\S+):\s*$')
+        results = {}  # accumulator: <ns>::<rule> -> summed cost
+        per_file_cost = {}  # fname -> total cost summed across rules
+        for i, fname in enumerate(flat_files, 1):
+            try:
+                proc = subprocess.run(
+                    [PROFILED_YARA_BIN, '-C', cyar, fname],
+                    capture_output=True, text=True, errors='replace')
+            except Exception as e:
+                print('[!]\tFailed scanning %s: %s' % (fname, e))
+                continue
+            in_block = False
+            file_cost = 0
+            for line in proc.stdout.splitlines():
+                if 'PROFILING INFORMATION' in line:
+                    in_block = True
+                    continue
+                if in_block and line.startswith('=='):
+                    in_block = False
+                    continue
+                if not in_block:
+                    continue
+                m = block_re.match(line)
+                if m:
+                    cost = int(m.group(1))
+                    key = '%s::%s' % (m.group(2), m.group(3))
+                    results[key] = results.get(key, 0) + cost
+                    file_cost += cost
+            per_file_cost[fname] = file_cost
+            # Progress: only rewrite on TTY; otherwise print sparsely so
+            # piped/captured output stays readable.
+            if is_tty:
+                sys.stderr.write('\rprofiled %d/%d files' % (i, len(flat_files)))
+                sys.stderr.flush()
+            elif i % 50 == 0 or i == len(flat_files):
+                sys.stderr.write('profiled %d/%d files\n' % (i, len(flat_files)))
+        if is_tty:
+            sys.stderr.write('\n')
+        profile_elapsed = time() - profile_start
+
+        if not results:
+            print('[!]\tNo profiling info captured. CLI exit=%s' % proc.returncode)
+            tail = '\n'.join(proc.stdout.splitlines()[-20:])
+            if proc.stderr.strip():
+                print('--- stderr (tail) ---\n%s' % '\n'.join(
+                    proc.stderr.splitlines()[-20:]))
+            if tail:
+                print('--- stdout (tail) ---\n%s' % tail)
+            return
+
+        # Mean of non-zero costs (zero-cost rules dominate the count when only
+        # a few rules actually fired; including them yields a tiny mean that
+        # makes every non-trivial rule look like an "outlier").
+        nonzero = [c for c in results.values() if c > 0]
+        if not nonzero:
+            print('[!]\tAll rules profiled at cost=0. Nothing to compare.')
+            return
+        mean_cost = sum(nonzero) / len(nonzero)
+
+        # Only flag SLOW outliers. The "fast outlier" check from the legacy
+        # implementation flooded the output with rules at cost=1-10 (rules
+        # whose atoms matched once or twice but the condition didn't fire)
+        # because the mean is heavily skewed by a handful of very-expensive
+        # rules. Symmetric-around-mean thresholding doesn't survive that
+        # skew, and slow outliers are what we actually want to find.
+        outliers = []
+        for key, cost in results.items():
+            if cost == 0:
+                continue
+            relative = cost / mean_cost
+            if relative > threshold:
+                outliers.append((relative, key, cost))
+        outliers.sort(reverse=True)
+
+        print('===== yarascan -P: per-rule outliers '
+              '(threshold=%g, mean nonzero cost=%.0f, n_rules=%d, '
+              'files=%d, profile-wallclock=%.1fs) ====='
+              % (threshold, mean_cost, len(results), len(flat_files),
+                 profile_elapsed))
+        for relative, key, cost in outliers:
+            print('{0:60}\t{1:>14}\t{2:>8.1f}%'.format(key, cost,
+                                                       relative * 100.0))
+        if not outliers:
+            print('(no outliers above threshold)')
+
+        # Top files by total cost -- useful for "which file is making the
+        # corpus expensive?" pivoting after rule-level results.
+        if per_file_cost:
+            top_files = sorted(per_file_cost.items(), key=lambda kv: -kv[1])[:5]
+            print('\n--- top 5 files by total cost ---')
+            for fname, c in top_files:
+                if c > 0:
+                    print('{0:>14}\t{1}'.format(c, fname))
+
+    finally:
+        try:
+            os.unlink(cyar)
+        except Exception:
+            pass
+
 
 
 def highest_impact(match):
@@ -701,8 +850,15 @@ if __name__ == '__main__':
     scan_files = scan_queue.qsize()
 
     if options.profile:
-        compiled_rules = build_rules(options.parsed_signatures, True)
-        print('built profiled rules')
+        # -P now subprocesses the profiled yara CLI (built with --enable-profiling).
+        # Compile rules normally; the CLI reads the resulting .cyar and emits
+        # per-rule cost attribution by <namespace>:<rule_name>. This bypasses
+        # yara-python entirely for the profiling step (see github issue
+        # VirusTotal/yara-python#155 -- yara-python.profiling_info() is
+        # broken against current libyara API).
+        compiled_rules = build_rules(options.parsed_signatures)
+        run_profile_via_cli(compiled_rules, args, options.threshold)
+        sys.exit(0)
     elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]):
         # Single precompiled .cyar fast path
         path, names = options.parsed_signatures[0]
@@ -832,31 +988,10 @@ if __name__ == '__main__':
                                             print(traceback.format_exc())
                     print()
     
-    if options.profile:
-        # group by signature, looking for outliers
-        profile_results = {}
-        while not profile_queue.empty():
-            item = profile_queue.get()
-            try:
-                profile_results[item['rulefile']][item['fname']] = item['time']
-            except:
-                profile_results[item['rulefile']] = {item['fname']: item['time']}
-
-        for rule, results in profile_results.items():
-            total = 0
-            for fname, duration in results.items():
-                total += duration
-            results['rule_average'] = total*1.0/len(results)
-
-        overall_average = (sum([x['rule_average'] for x in profile_results.values()]) - results['rule_average'])/(1.0*(len(profile_results)-1))
-        for rule, results in profile_results.items():
-            try:
-                relative = results['rule_average']/overall_average
-                if relative > options.threshold or relative < (1.0/options.threshold):
-                    print('{0:50}\t{1:0.1f}%'.format(os.path.basename(rule), relative*100.0))
-            except Exception as e:
-                import traceback
-                print('Failed to calculate results for {}: {}'.format(rule, traceback.format_exc()))
+    # -P no longer aggregates here -- it sys.exit()s above after the CLI
+    # subprocess. This block is intentionally left only for the legacy
+    # profile_queue path (still drained by worker() if --profile was set,
+    # but the new --profile branch never starts those workers).
 
     if options.performance:
         elapsed = time() - start

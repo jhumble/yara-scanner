@@ -117,19 +117,46 @@ The mixed rendering is automatic: `$val_schtasks` is mostly UTF-16LE surrounding
 ### Rule performance profiling
 
 ```
-$ yarascan.py -P -T 2.0 -S yara-rules/ \
-              ~/RE/samples/malpedia/win.asyncrat/ \
-              ~/RE/samples/malpedia/win.njrat/ \
-              ~/RE/samples/malpedia/win.rhadamanthys/
+$ yarascan.py -P -T 3 -S yara-rules/ /tmp/unk3/
+profiled 50/602 files
+profiled 100/602 files
 ...
-Classification_AsyncRat.yar                        36.2%
-Classification_njRAT.yar                           24.7%
-Classification_Remcos.yar                          33.3%
-Shellcode_Get_EIP.yar                             341.9%
-Shellcode_Alloc_RWX_Mem.yar                       205.5%
+profiled 602/602 files
+===== yarascan -P: per-rule outliers (threshold=3, mean nonzero cost=929614457, n_rules=1730, files=602, profile-wallclock=178.0s) =====
+Classification_Kutaki::Classification_Kutaki_EricsVersion       308910591939   33230.0%
+SlackConnect_TOAD_Email::SlackConnect_TOAD_Email                275387004255   29623.8%
+fdr_defense_evasion::fdr_defense_evasion_PowerShell_Alias_Abuse 249704034096   26861.0%
+Classification_Pyobfuscate::Classification_Pyobfuscate_Online   171826631955   18483.6%
+Classification_DarkGate::DarkGate_Html_Dropper                   95794439142   10304.7%
+...
+--- top 5 files by total cost ---
+   501612870571	/tmp/unk3/logs/flog.xml
+   384956663963	/tmp/unk3/logs/analysis.binlog
+   363203636610	/tmp/unk3/17316713.zip
+    35166053131	/tmp/unk3/logs/flog.txt
+    14910104038	/tmp/unk3/internal/static_analyses/sample_static_analysis_cfg.json
 ```
 
-Each number is the rule's mean runtime as a percent of the overall mean. Anything over `-T * 100` (340% with `-T 2.0`, which is the 2× threshold used here after inversion) or under `100 / -T` (50%) gets flagged. `Shellcode_Get_EIP` at ~340% of average is the one to look at first — typically either an unbounded regex quantifier or a string that falls back to brute-forcing the whole file.
+Output is keyed `<rulefile>::<rule_name>`, so multi-rule `.yar` files (Classification_AgentTesla.yar contains 7 rules; Classification_Rhadamanthys.yar contains ~15) are attributed to the specific rule that's expensive rather than lumped at the file level.
+
+The "cost" is the engine's own per-rule cost counter (`atom_matches × match_time + exec_time`, with verification time sampled 1-in-1024 — that's why the numbers are integers in the billions, not nanoseconds). Use them as a relative ranking, not a wallclock estimate. Anything above `-T × 100%` (default 300%) of the mean nonzero rule cost is shown. Fast-side outliers are intentionally suppressed — they were dominated by rules whose atoms matched once or twice but the condition never fired, which made every interesting rule look like an "outlier" in the legacy implementation.
+
+The "top 5 files by total cost" block below the rule outliers points at which input file made the corpus expensive — a useful pivot when one slow rule's cost is concentrated on a single artifact.
+
+**Setup required.** `-P` shells out to a separately-built `yara` CLI compiled with `--enable-profiling` (because yara-python's `profiling_info()` is broken against current libyara — see issue [VirusTotal/yara-python#155](https://github.com/VirusTotal/yara-python/issues/155)). The path is hardcoded to `~/tools/yara-scanner/yara-profiling/bin/yara`; build it with:
+
+```
+git clone https://github.com/VirusTotal/yara.git ~/tools/build-yara/yara
+cd ~/tools/build-yara/yara
+./bootstrap.sh
+./configure --enable-profiling --prefix=~/tools/yara-scanner/yara-profiling
+make -j$(nproc)
+make install
+```
+
+This is a separate install from your system `yara` — it lives under `~/tools/yara-scanner/yara-profiling/` and is only invoked when you pass `-P`. Your normal yarascan runs use the system libyara (no profiling overhead).
+
+If the profiled binary is missing, `yarascan -P` warns and exits cleanly with build instructions; no other modes are affected.
 
 ### Sort matches into per-rule bins
 
