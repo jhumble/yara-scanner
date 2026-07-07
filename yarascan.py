@@ -200,6 +200,52 @@ def _humanize_time(sec):
     return '%.0fns' % (sec * 1e9)
 
 
+# Column width for the "rule" / "rule::pattern" column in the -P output.
+# Wide enough to fit most real names without truncation on ice-53-scale
+# rulesets; when we have to truncate, we prefer to shorten the namespace
+# and rule identifiers and keep the pattern identifier intact -- the
+# pattern is the actionable field for tuning.
+_PROFILE_NAME_COL = 80
+
+
+def _fmt_name_col(*parts, width=_PROFILE_NAME_COL):
+    """Format identifiers joined by '::' into a fixed-width column.
+
+    If the joined string overruns width, truncate the earlier parts with
+    a horizontal-ellipsis (…) but keep the LAST part intact -- for
+    the patterns table this is the pattern identifier, which is the
+    field you actually want to see. Rules table calls this with just
+    (namespace, rule) so 'rule' plays the role of the preserved part.
+    """
+    joined = '::'.join(parts)
+    if len(joined) <= width:
+        return joined.ljust(width)
+    # Overrun. Reserve room for the last part in full plus its '::' separator.
+    last = parts[-1]
+    # Guard: if the pattern alone is longer than the width, just show it
+    # truncated -- there's nothing better to do.
+    if len(last) + 2 >= width:
+        return last[:width]
+    remaining = width - len(last) - 2  # room for '::last'
+    head_parts = list(parts[:-1])
+    # Distribute the remaining budget across the head parts. Separators
+    # between them cost '::' per join.
+    sep_cost = 2 * (len(head_parts) - 1) if len(head_parts) > 1 else 0
+    budget_for_ids = remaining - sep_cost
+    # Split evenly; give any extra chars to the first identifier since
+    # namespaces are typically longer.
+    per = max(4, budget_for_ids // len(head_parts))
+    leftover = budget_for_ids - per * len(head_parts)
+    trimmed = []
+    for i, p in enumerate(head_parts):
+        cap = per + (leftover if i == 0 else 0)
+        if len(p) <= cap:
+            trimmed.append(p)
+        else:
+            trimmed.append(p[: max(1, cap - 1)] + '…')
+    return ('::'.join(trimmed) + '::' + last).ljust(width)
+
+
 def _profile_supported():
     """Probe whether yara-x was built with the rules-profiling feature.
 
@@ -332,7 +378,7 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
           % (len(flat_files), wallclock, len(slowest_rules)))
     print('Rules (mean total cost %s, threshold >=%.0f%% of mean):'
           % (_humanize_time(mean_rule), threshold * 100))
-    print('    %-10s %-6s  %-56s  notes' % ('cost', '%mean', 'rule'))
+    print('    %-10s %-6s  %-*s  notes' % ('cost', '%mean', _PROFILE_NAME_COL, 'rule'))
     n_shown = 0
     for r in slowest_rules:
         if top_n and n_shown >= top_n:
@@ -344,9 +390,10 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
         notes = []
         if r['condition_exec_time'] > 0.001:
             notes.append('condition %s' % _humanize_time(r['condition_exec_time']))
-        rule_full = '%s::%s' % (r['namespace'], r['rule'])
-        print('    %-10s %5.0f%%  %-56s  %s'
-              % (_humanize_time(total), pct * 100, rule_full[:56], ' '.join(notes)))
+        print('    %-10s %5.0f%%  %s  %s'
+              % (_humanize_time(total), pct * 100,
+                 _fmt_name_col(r['namespace'], r['rule']),
+                 ' '.join(notes)))
         n_shown += 1
     if n_shown == 0:
         print('    (nothing above threshold)')
@@ -357,7 +404,7 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
     mean_pat = (total_pat_time / len(slowest_patterns)) if slowest_patterns else 0
     print('Patterns (mean matching time %s, threshold >=%.0f%% of mean):'
           % (_humanize_time(mean_pat), threshold * 100))
-    print('    %-10s %-6s  %-56s  notes' % ('cost', '%mean', 'rule::pattern'))
+    print('    %-10s %-6s  %-*s  notes' % ('cost', '%mean', _PROFILE_NAME_COL, 'rule::pattern'))
     n_shown = 0
     for p in slowest_patterns:
         if top_n and n_shown >= top_n:
@@ -375,10 +422,10 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
             notes.append('capped @%dM matches' % (mc // 1_000_000))
         elif mc >= 100_000:
             notes.append('%d matches' % mc)
-        full = '%s::%s::%s' % (p['namespace'], p['rule'], p['pattern'])
-        print('    %-10s %5.0f%%  %-56s  %s'
+        print('    %-10s %5.0f%%  %s  %s'
               % (_humanize_time(p['matching_time']), pct * 100,
-                 full[:56], ' '.join(notes)))
+                 _fmt_name_col(p['namespace'], p['rule'], p['pattern']),
+                 ' '.join(notes)))
         n_shown += 1
     if n_shown == 0:
         print('    (nothing above threshold)')
