@@ -383,13 +383,28 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
     top_n = options.top_n
     MATCH_CAP = 1_000_000
 
+    # Sort by size descending so the biggest / slowest files start at t=0
+    # on every worker. The tail then consists of many small files that
+    # distribute evenly. Prior default (whatever recursive_all_files returned)
+    # let heavy files cluster into trailing chunks, causing one worker to
+    # grind for hours at the tail while the other 7 sat idle. os.path.getsize
+    # failure sinks the file to the end so it still gets scanned.
+    def _size(f):
+        try:
+            return os.path.getsize(f)
+        except OSError:
+            return -1
+    flat_files.sort(key=_size, reverse=True)
+
     # Chunk size trades off progress-update granularity against overhead per
-    # task submission / result marshal. Target ~4x num_workers chunks so
-    # every worker gets multiple chunks (load balancing) but cap chunk size
-    # at 100 files so we get sub-second progress ticks on large corpora.
-    # On 160 files/8 workers: 5-file chunks, 32 chunks total.
-    # On 160k files/8 workers: 100-file chunks (capped), ~1600 chunks total.
-    CHUNK_SIZE = max(1, min(100, len(flat_files) // (options.num_threads * 4)))
+    # task submission / result marshal. Small chunks give the executor's work
+    # queue more opportunities to steal from a slow worker onto an idle one
+    # (better tail balance) at a cost of a few seconds of pickle overhead
+    # across the full run. Cap at 10 files per chunk; on very small corpora
+    # divide down further so all workers get multiple chunks.
+    #   160 files / 8 workers -> 5-file chunks, 32 chunks total.
+    #   160k files / 8 workers -> 10-file chunks, ~16000 chunks total.
+    CHUNK_SIZE = max(1, min(10, len(flat_files) // (options.num_threads * 4)))
     chunks = [flat_files[i:i + CHUNK_SIZE]
               for i in range(0, len(flat_files), CHUNK_SIZE)]
 
@@ -403,11 +418,13 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
     profile_start = time()
     files_done = 0
 
-    with ProcessPoolExecutor(
+    interrupted = False
+    ex = ProcessPoolExecutor(
         max_workers=options.num_threads,
         initializer=_profile_worker_init,
         initargs=(yxc_path,),
-    ) as ex:
+    )
+    try:
         futures = [ex.submit(_profile_worker_chunk, c) for c in chunks]
         for fut in as_completed(futures):
             result = fut.result()
@@ -429,7 +446,20 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
                 sys.stderr.flush()
             elif files_done % 5000 < CHUNK_SIZE:  # rate-limit to ~every 5k files
                 sys.stderr.write('profiled %d/%d files\n' % (files_done, len(flat_files)))
-    if is_tty:
+    except KeyboardInterrupt:
+        interrupted = True
+        if is_tty:
+            sys.stderr.write('\n')
+        # Cancel outstanding chunks so the executor shuts down quickly.
+        # Workers already running their current chunk will still complete it
+        # (up to ~CHUNK_SIZE files each), but no new chunks get dispatched.
+        # cancel_futures=True is Python 3.9+; safe on 3.13.
+        print('[!]\tInterrupted at %d/%d files; rendering partial results'
+              % (files_done, len(flat_files)))
+        ex.shutdown(wait=True, cancel_futures=True)
+    else:
+        ex.shutdown(wait=True)
+    if is_tty and not interrupted:
         sys.stderr.write('\n')
     wallclock = time() - profile_start
 
