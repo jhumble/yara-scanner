@@ -305,14 +305,68 @@ def _collect_compile_warnings(parsed_signatures):
     return warns
 
 
-def run_profile_native(compiled_rules, scan_targets, options, warnings_by_pattern):
+# Per-worker-process state for the -P parallel path. Populated by
+# _profile_worker_init at worker startup; read on every chunk.
+_profile_scanner = None
+
+
+def _profile_worker_init(yxc_path):
+    """ProcessPoolExecutor initializer for -P workers. Deserializes the
+    .yxc rules blob once per worker so subsequent chunks reuse the Scanner."""
+    global _profile_scanner
+    with open(yxc_path, 'rb') as fp:
+        rules = yx.Rules.deserialize_from(fp)
+    _profile_scanner = yx.Scanner(rules)
+
+
+def _profile_worker_chunk(files_chunk):
+    """Scan a chunk of files in a worker process. Returns snapshot-of-just-this-chunk
+    profiling data so the main can safely sum across chunks without double-counting.
+
+    We call clear_profiling_data() BEFORE each chunk so the Scanner's cumulative
+    counters restart at zero. The snapshot at the end of the chunk therefore only
+    reflects the current chunk's work, and main can straightforwardly sum
+    per-(ns, rule, pattern) time across all chunk results.
+    """
+    from time import perf_counter
+    _profile_scanner.clear_profiling_data()
+    per_file_cost = {}
+    match_counts = {}  # (ns, rule, pattern) -> match count
+    errors = []
+    for fname in files_chunk:
+        t0 = perf_counter()
+        try:
+            stats = _profile_scanner.scan_file_stats(fname)
+        except Exception as e:
+            errors.append((fname, str(e)))
+            continue
+        per_file_cost[fname] = perf_counter() - t0
+        for key, cnt in stats.items():
+            match_counts[key] = match_counts.get(key, 0) + cnt
+    # Chunk-only snapshot (safe to sum because we clear'd at the start).
+    slowest_rules = list(_profile_scanner.slowest_rules(1_000_000))
+    slowest_patterns = list(_profile_scanner.slowest_patterns(1_000_000))
+    return {
+        'per_file_cost': per_file_cost,
+        'match_counts': match_counts,
+        'slowest_rules': slowest_rules,
+        'slowest_patterns': slowest_patterns,
+        'errors': errors,
+    }
+
+
+def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings_by_pattern):
     """Native profiler using yara-x's Scanner.slowest_rules / slowest_patterns.
 
-    Runs single-process so all profiling accumulates in one Scanner. -P is a
-    diagnostic mode, not the hot path, so the parallelism trade-off is fine.
+    Runs in parallel via ProcessPoolExecutor to scale across cores. Each worker
+    owns its own Scanner (yara-x's Python binding does NOT release the GIL, so
+    threading would serialize -- see fix for main scan phase). Files are
+    dispatched in small chunks (default 100) so we get near-real-time progress
+    updates and workload balances across workers naturally.
 
-    Also captures per-(rule, pattern) match counts so we can annotate patterns
-    that hit yara-x's 1M-per-pattern silent match cap ("firehose" signal).
+    Chunk-level aggregation avoids double-counting: each worker calls
+    clear_profiling_data() before each chunk and returns the chunk's snapshot;
+    main sums per-(ns, rule, pattern).
     """
     # Expand target dirs into files
     flat_files = []
@@ -327,55 +381,93 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
 
     threshold = options.threshold
     top_n = options.top_n
-    # yara-x silently caps matches per pattern at 1,000,000 -- callers
-    # should treat "at or near the cap" as a firehose signal.
     MATCH_CAP = 1_000_000
 
-    scanner = yx.Scanner(compiled_rules)
-    match_counts = {}   # (rule, pattern) -> total match count summed across files
-    per_file_cost = {}  # fname -> wall time to scan this file
+    # Chunk size trades off progress-update granularity against overhead per
+    # task submission / result marshal. Target ~4x num_workers chunks so
+    # every worker gets multiple chunks (load balancing) but cap chunk size
+    # at 100 files so we get sub-second progress ticks on large corpora.
+    # On 160 files/8 workers: 5-file chunks, 32 chunks total.
+    # On 160k files/8 workers: 100-file chunks (capped), ~1600 chunks total.
+    CHUNK_SIZE = max(1, min(100, len(flat_files) // (options.num_threads * 4)))
+    chunks = [flat_files[i:i + CHUNK_SIZE]
+              for i in range(0, len(flat_files), CHUNK_SIZE)]
 
-    from time import perf_counter
+    # Aggregates on the main side.
+    per_file_cost = {}
+    match_counts = {}          # (ns, rule, pattern) -> total match count
+    agg_pattern_time = {}      # (ns, rule, pattern) -> summed matching_time
+    agg_rule_condition = {}    # (ns, rule) -> summed condition_exec_time
+
     is_tty = sys.stderr.isatty()
     profile_start = time()
-    for i, fname in enumerate(flat_files, 1):
-        t0 = perf_counter()
-        try:
-            results = scanner.scan_file(fname)
-        except Exception as e:
-            print('[!]\tFailed scanning %s: %s' % (fname, e))
-            continue
-        per_file_cost[fname] = perf_counter() - t0
-        # Match-count accumulation for the "capped/firehose" note
-        for r in results.matching_rules:
-            for p in r.patterns:
-                key = (r.identifier, p.identifier)
-                match_counts[key] = match_counts.get(key, 0) + len(p.matches)
-        # Progress line
-        if is_tty:
-            sys.stderr.write('\rprofiled %d/%d files' % (i, len(flat_files)))
-            sys.stderr.flush()
-        elif i % 50 == 0 or i == len(flat_files):
-            sys.stderr.write('profiled %d/%d files\n' % (i, len(flat_files)))
+    files_done = 0
+
+    with ProcessPoolExecutor(
+        max_workers=options.num_threads,
+        initializer=_profile_worker_init,
+        initargs=(yxc_path,),
+    ) as ex:
+        futures = [ex.submit(_profile_worker_chunk, c) for c in chunks]
+        for fut in as_completed(futures):
+            result = fut.result()
+            per_file_cost.update(result['per_file_cost'])
+            for k, v in result['match_counts'].items():
+                match_counts[k] = match_counts.get(k, 0) + v
+            for p in result['slowest_patterns']:
+                key = (p['namespace'], p['rule'], p['pattern'])
+                agg_pattern_time[key] = agg_pattern_time.get(key, 0) + p['matching_time']
+            for r in result['slowest_rules']:
+                key = (r['namespace'], r['rule'])
+                agg_rule_condition[key] = agg_rule_condition.get(key, 0) + r['condition_exec_time']
+            for fname, err in result['errors']:
+                print('[!]\tFailed scanning %s: %s' % (fname, err))
+            files_done += len(result['per_file_cost']) + len(result['errors'])
+            # Progress
+            if is_tty:
+                sys.stderr.write('\rprofiled %d/%d files' % (files_done, len(flat_files)))
+                sys.stderr.flush()
+            elif files_done % 5000 < CHUNK_SIZE:  # rate-limit to ~every 5k files
+                sys.stderr.write('profiled %d/%d files\n' % (files_done, len(flat_files)))
     if is_tty:
         sys.stderr.write('\n')
     wallclock = time() - profile_start
 
-    # Get profiling data. Ask for a big N so filtering happens here in Python
-    # rather than in the Rust cutoff.
-    slowest_rules = scanner.slowest_rules(1000)
-    slowest_patterns = scanner.slowest_patterns(1000)
+    # Build the slowest_rules / slowest_patterns lists the render code expects.
+    # Rules: pattern time comes from summing the per-pattern aggregate up by
+    # rule; condition time comes from the aggregate_rule_condition dict.
+    # (yara-x's slowest_rules has a 100ms condition floor per chunk, so if a
+    # rule's condition never crossed that in any single chunk, condition time
+    # underrepresents. Pattern time is always accurate because slowest_patterns
+    # has no floor after our lib patch.)
+    agg_rule_pattern = {}
+    for (ns, rule, _pat), t in agg_pattern_time.items():
+        agg_rule_pattern[(ns, rule)] = agg_rule_pattern.get((ns, rule), 0) + t
+    slowest_rules = sorted([
+        {
+            'namespace': ns,
+            'rule': rule,
+            'condition_exec_time': agg_rule_condition.get((ns, rule), 0),
+            'pattern_matching_time': pat_time,
+        }
+        for (ns, rule), pat_time in agg_rule_pattern.items()
+    ], key=lambda r: -(r['condition_exec_time'] + r['pattern_matching_time']))
+    slowest_patterns = sorted([
+        {'namespace': ns, 'rule': rule, 'pattern': pat, 'matching_time': t}
+        for (ns, rule, pat), t in agg_pattern_time.items()
+    ], key=lambda p: -p['matching_time'])
 
     # ---- Rules table --------------------------------------------------------
     total_rule_time = sum(r['condition_exec_time'] + r['pattern_matching_time']
                           for r in slowest_rules)
     mean_rule = (total_rule_time / len(slowest_rules)) if slowest_rules else 0
-    # yara-x's slowest_rules has a hardcoded 100ms floor at the Rust layer;
-    # rules cheaper than that aren't returned regardless of the -N cap. We
-    # surface that in the header so users understand why the rules table
-    # sometimes has fewer rows than the patterns table.
-    print('===== yarascan -P (%d files, wallclock %.1fs, %d rules >=100ms) =====\n'
-          % (len(flat_files), wallclock, len(slowest_rules)))
+    # slowest_patterns has no time floor (our lib patch); slowest_rules
+    # inherits yara-x's per-scan 100ms condition-time floor, so
+    # condition_exec_time in the rules table underrepresents for rules with
+    # only mild condition cost. Pattern time in the rules table is always
+    # accurate because it's aggregated from per-pattern data.
+    print('===== yarascan -P (%d files, %d chunks x%d workers, wallclock %.1fs) =====\n'
+          % (len(flat_files), len(chunks), options.num_threads, wallclock))
     print('Rules (mean total cost %s, threshold >=%.0f%% of mean):'
           % (_humanize_time(mean_rule), threshold * 100))
     print('    %-10s %-6s  %-*s  notes' % ('cost', '%mean', _PROFILE_NAME_COL, 'rule'))
@@ -417,7 +509,7 @@ def run_profile_native(compiled_rules, scan_targets, options, warnings_by_patter
         if (p['rule'], p['pattern']) in warnings_by_pattern:
             notes.extend(warnings_by_pattern[(p['rule'], p['pattern'])])
         # Firehose / cap-hit?
-        mc = match_counts.get((p['rule'], p['pattern']), 0)
+        mc = match_counts.get((p['namespace'], p['rule'], p['pattern']), 0)
         if mc >= MATCH_CAP:
             notes.append('capped @%dM matches' % (mc // 1_000_000))
         elif mc >= 100_000:
@@ -905,9 +997,9 @@ if __name__ == '__main__':
             print('[!]\t    cd ~/tools/yara-x/py && maturin build --release --features rules-profiling')
             print('[!]\t    pip install --user --force-reinstall --no-deps ../target/wheels/yara_x-*.whl')
             sys.exit(1)
-        compiled_rules, rule_filter, _yxc = build_rules(options.parsed_signatures)
+        compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
         warnings_by_pattern = _collect_compile_warnings(options.parsed_signatures)
-        run_profile_native(compiled_rules, args, options, warnings_by_pattern)
+        run_profile_native(compiled_rules, yxc_path, args, options, warnings_by_pattern)
         sys.exit(0)
     elif len(options.parsed_signatures) == 1 and os.path.isfile(options.parsed_signatures[0][0]) \
             and options.parsed_signatures[0][0].endswith('.yxc'):
