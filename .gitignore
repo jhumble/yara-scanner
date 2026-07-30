@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local virtualenv used for yara-x profiling builds
+yara-profiling/
+
+# Stray run artifacts
+nohup.out
+/-sop
+*.cyar
