@@ -200,6 +200,28 @@ def _humanize_time(sec):
     return '%.0fns' % (sec * 1e9)
 
 
+def _humanize_bytes(n):
+    """Format bytes compactly. 1536 -> '1.5 KB', 1200000 -> '1.2 MB'."""
+    if n >= 1 << 30:
+        return '%.1f GB' % (n / (1 << 30))
+    if n >= 1 << 20:
+        return '%.1f MB' % (n / (1 << 20))
+    if n >= 1 << 10:
+        return '%.1f KB' % (n / (1 << 10))
+    return '%d B' % n
+
+
+def _humanize_rate(bytes_per_sec):
+    """Format a scan rate. 12000000 -> '11.4 MB/s'."""
+    if bytes_per_sec >= 1 << 30:
+        return '%.1f GB/s' % (bytes_per_sec / (1 << 30))
+    if bytes_per_sec >= 1 << 20:
+        return '%.1f MB/s' % (bytes_per_sec / (1 << 20))
+    if bytes_per_sec >= 1 << 10:
+        return '%.1f KB/s' % (bytes_per_sec / (1 << 10))
+    return '%d B/s' % bytes_per_sec
+
+
 # Column width for the "rule" / "rule::pattern" column in the -P output.
 # Wide enough to fit most real names without truncation on ice-53-scale
 # rulesets; when we have to truncate, we prefer to shorten the namespace
@@ -389,12 +411,17 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
     # let heavy files cluster into trailing chunks, causing one worker to
     # grind for hours at the tail while the other 7 sat idle. os.path.getsize
     # failure sinks the file to the end so it still gets scanned.
-    def _size(f):
+    # Also cache the sizes in a dict so the progress ticker (below) can turn
+    # per-chunk file counts into per-chunk byte counts without a second
+    # os.path.getsize pass.
+    file_sizes = {}
+    for f in flat_files:
         try:
-            return os.path.getsize(f)
+            file_sizes[f] = os.path.getsize(f)
         except OSError:
-            return -1
-    flat_files.sort(key=_size, reverse=True)
+            file_sizes[f] = 0
+    flat_files.sort(key=lambda f: file_sizes.get(f, 0), reverse=True)
+    total_scan_size = sum(file_sizes.values())
 
     # Chunk size trades off progress-update granularity against overhead per
     # task submission / result marshal. Small chunks give the executor's work
@@ -417,6 +444,21 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
     is_tty = sys.stderr.isatty()
     profile_start = time()
     files_done = 0
+
+    # When -p is set, drive the same Progress + ticker thread used by the
+    # regular scan path (bytes/total, ETA, matches). Otherwise fall back to
+    # the plain "profiled N/M files" line so we don't spam a piped log.
+    show_full_progress = options.performance and is_tty
+    if show_full_progress:
+        progress = Progress(total_scan_size)
+        stop_ticker = threading.Event()
+        ticker_thread = threading.Thread(
+            target=_progress_ticker, args=(progress, stop_ticker), daemon=True)
+        ticker_thread.start()
+    else:
+        progress = None
+        stop_ticker = None
+        ticker_thread = None
 
     interrupted = False
     ex = ProcessPoolExecutor(
@@ -441,11 +483,31 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
                 print('[!]\tFailed scanning %s: %s' % (fname, err))
             files_done += len(result['per_file_cost']) + len(result['errors'])
             # Progress
-            if is_tty:
+            if progress is not None:
+                # Turn per-file completions into byte progress via the cached size table.
+                for fname in result['per_file_cost']:
+                    progress.bytes_scanned += file_sizes.get(fname, 0)
+                for fname, _err in result['errors']:
+                    progress.bytes_scanned += file_sizes.get(fname, 0)
+                progress.files_scanned = files_done
+                # Approximate "files with matches" from match_counts growth --
+                # match_counts tracks per (ns, rule, pattern) so its raw size
+                # isn't file count, but it monotonically grows on hit chunks
+                # which is close enough for the display.
+                progress.match_count = len(match_counts)
+            elif is_tty:
                 sys.stderr.write('\rprofiled %d/%d files' % (files_done, len(flat_files)))
                 sys.stderr.flush()
             elif files_done % 5000 < CHUNK_SIZE:  # rate-limit to ~every 5k files
                 sys.stderr.write('profiled %d/%d files\n' % (files_done, len(flat_files)))
+            # Drop the chunk's result dict now that its contents are folded
+            # into the aggregate dicts. Without this, ProcessPoolExecutor
+            # retains every Future._result until the loop exits -- with 16k
+            # chunks and ~600 KB per chunk snapshot (dominated by
+            # slowest_patterns), that's ~10 GB of avoidable memory pressure
+            # that OOM'd a real 162k-file run.
+            del result
+            fut._result = None
     except KeyboardInterrupt:
         interrupted = True
         if is_tty:
@@ -459,7 +521,16 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
         ex.shutdown(wait=True, cancel_futures=True)
     else:
         ex.shutdown(wait=True)
-    if is_tty and not interrupted:
+    # Stop the ticker thread if -p was on; render one final line so the
+    # last state is printed even if the ticker's sleep hasn't elapsed.
+    if stop_ticker is not None:
+        stop_ticker.set()
+        if ticker_thread is not None:
+            ticker_thread.join(timeout=1.5)
+        if progress is not None:
+            progress.render()
+            sys.stderr.write('\n')
+    elif is_tty and not interrupted:
         sys.stderr.write('\n')
     wallclock = time() - profile_start
 
@@ -553,13 +624,40 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
         print('    (nothing above threshold)')
     print()
 
-    # ---- Top files by cost --------------------------------------------------
+    # ---- Top files by scan rate --------------------------------------------
+    # Sort ascending by bytes/second so the slowest-per-byte files bubble up.
+    # A pathological regex on a small file gives a much worse bytes/sec than
+    # a well-behaved scan on a large file. To avoid tiny-file noise where
+    # per-file yara-x/Python overhead (~700us) dominates and dwarfs the
+    # actual scan work, we drop files below a minimum-wall-time floor before
+    # sorting -- if a file completed in <100ms, it wasn't the bottleneck no
+    # matter what its rate looks like.
     if per_file_cost:
-        top_files = sorted(per_file_cost.items(), key=lambda kv: -kv[1])[:5]
-        print('--- top 5 files by wall time ---')
-        for fname, c in top_files:
-            if c > 0:
-                print('    %-10s %s' % (_humanize_time(c), fname))
+        MIN_WALL = 0.100  # 100ms floor to filter out per-file overhead noise
+        cap = top_n if top_n else 20
+        enriched = []
+        for fname, wall in per_file_cost.items():
+            if wall < MIN_WALL:
+                continue
+            try:
+                size = os.path.getsize(fname)
+            except OSError:
+                size = 0
+            rate = (size / wall) if wall > 0 else 0
+            enriched.append((fname, wall, size, rate))
+        # Sort by rate ascending (slowest bytes/sec first)
+        enriched.sort(key=lambda t: t[3])
+        top_files = enriched[:cap]
+        n_filtered = sum(1 for _, w in per_file_cost.items() if w < MIN_WALL)
+        print('--- top %d files by scan rate (slowest first, wall >= %.0fms; %d files below floor elided) ---'
+              % (len(top_files), MIN_WALL * 1000, n_filtered))
+        print('    %-10s %-10s %-10s  file' % ('rate', 'wall', 'size'))
+        for fname, wall, size, rate in top_files:
+            print('    %-10s %-10s %-10s  %s'
+                  % (_humanize_rate(rate),
+                     _humanize_time(wall),
+                     _humanize_bytes(size),
+                     fname))
 
 
 
@@ -1067,27 +1165,39 @@ if __name__ == '__main__':
     # threading serializes at ~100% single-thread CPU. We use processes to
     # get real parallelism -- each worker deserializes the .yxc once at
     # startup and reuses the same Scanner for every scan it runs.
+    ex = ProcessPoolExecutor(
+        max_workers=options.num_threads,
+        initializer=_worker_init,
+        initargs=(yxc_path, rule_filter),
+    )
     try:
-        with ProcessPoolExecutor(
-            max_workers=options.num_threads,
-            initializer=_worker_init,
-            initargs=(yxc_path, rule_filter),
-        ) as ex:
-            futures = [ex.submit(_worker_scan_one, f, sz) for f, sz in jobs]
-            for fut in as_completed(futures):
-                fname, size, matches, err = fut.result()
-                progress.bytes_scanned += size
-                progress.files_scanned += 1
-                if err is not None:
-                    print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
-                    continue
-                if matches:
-                    progress.match_count += 1
-                    results.append({'matches': matches, 'fname': fname})
-                elif options.negative:
-                    results.append({'matches': [], 'fname': fname})
+        futures = [ex.submit(_worker_scan_one, f, sz) for f, sz in jobs]
+        for fut in as_completed(futures):
+            fname, size, matches, err = fut.result()
+            progress.bytes_scanned += size
+            progress.files_scanned += 1
+            if err is not None:
+                print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
+                continue
+            if matches:
+                progress.match_count += 1
+                results.append({'matches': matches, 'fname': fname})
+            elif options.negative:
+                results.append({'matches': [], 'fname': fname})
+        ex.shutdown(wait=True)
     except KeyboardInterrupt:
-        print('\nInterrupted; outputting results collected so far')
+        print('\nInterrupted; killing workers and outputting results collected so far')
+        # yara-x's Rust scan_file() holds the GIL and doesn't check Python
+        # signals, so ex.shutdown(wait=True) would block for however long a
+        # worker's current scan takes to return -- can be minutes on huge
+        # files. Force-terminate workers instead so we can drain what's been
+        # collected and get out.
+        for p in list(ex._processes.values()):
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        ex.shutdown(wait=False, cancel_futures=True)
     finally:
         stop_ticker.set()
         if ticker_thread is not None:
