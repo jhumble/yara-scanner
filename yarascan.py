@@ -9,6 +9,7 @@ import glob
 import shutil
 
 import json
+import logging
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from utils import recursive_all_files
 from time import sleep, time
@@ -21,6 +22,18 @@ from pprint import pprint
 
 
 DEFAULT_RULES_DIR = '/home/jhumble/RE/ice-53-yara-rules/'
+
+logger = logging.getLogger('yarascan')
+
+
+def configure_logger(log_level):
+    """Map -v occurrences to a log level: 0 -> ERROR (the default), 1 -> WARNING,
+    2 -> INFO, 3 -> DEBUG. Rule compile failures and scan errors log at ERROR so
+    they surface with no -v at all (matching what ICE reports)."""
+    log_levels = {0: logging.ERROR, 1: logging.WARNING, 2: logging.INFO, 3: logging.DEBUG}
+    log_level = min(max(log_level, 0), 3)  # clamp to 0-3 inclusive
+    logging.basicConfig(level=log_levels[log_level],
+        format='%(asctime)s - %(name)s - %(levelname)-8s %(message)s')
 
 
 def build_arg_parser():
@@ -73,10 +86,14 @@ def build_arg_parser():
         help='Max offsets to print per string')
     p.add_argument('-d', '--disassemble', choices=['64', '32'], default=None,
         help='Disassemble matching bytes using 32/64 bit mode as provided')
+    p.add_argument('-v', '--verbose', action='count', default=0,
+        help='Increase verbosity. Default shows errors only (incl. rules that '
+             'fail to compile); -v=warnings, -vv=info, -vvv=debug.')
     return p
 
 
 options = build_arg_parser().parse_args()
+configure_logger(options.verbose)
 args = options.paths  # positional target files/dirs (was args from optparse)
 options.user_provided_signatures = options.signatures is not None
 if not options.signatures:
@@ -301,7 +318,7 @@ def _collect_compile_warnings(parsed_signatures):
             continue
         for rulefile in candidates:
             try:
-                c = yx.Compiler(relaxed_re_syntax=True)
+                c = yx.Compiler()
                 c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
                 c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
                 with open(rulefile) as fp:
@@ -398,7 +415,7 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
         elif os.path.isfile(t):
             flat_files.append(t)
     if not flat_files:
-        print('[!]\tNo files to scan after expanding targets: %s' % scan_targets)
+        logger.error('No files to scan after expanding targets: %s', scan_targets)
         return
 
     threshold = options.threshold
@@ -480,7 +497,7 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
                 key = (r['namespace'], r['rule'])
                 agg_rule_condition[key] = agg_rule_condition.get(key, 0) + r['condition_exec_time']
             for fname, err in result['errors']:
-                print('[!]\tFailed scanning %s: %s' % (fname, err))
+                logger.error('Failed scanning %s: %s', fname, err)
             files_done += len(result['per_file_cost']) + len(result['errors'])
             # Progress
             if progress is not None:
@@ -516,8 +533,8 @@ def run_profile_native(compiled_rules, yxc_path, scan_targets, options, warnings
         # Workers already running their current chunk will still complete it
         # (up to ~CHUNK_SIZE files each), but no new chunks get dispatched.
         # cancel_futures=True is Python 3.9+; safe on 3.13.
-        print('[!]\tInterrupted at %d/%d files; rendering partial results'
-              % (files_done, len(flat_files)))
+        logger.warning('Interrupted at %d/%d files; rendering partial results',
+                       files_done, len(flat_files))
         ex.shutdown(wait=True, cancel_futures=True)
     else:
         ex.shutdown(wait=True)
@@ -843,9 +860,8 @@ def filter_match(match, fname, rule_filter=None):
 
         return False
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        
+        logger.debug('exception in match filter', exc_info=True)
+
 
 
 
@@ -868,7 +884,7 @@ def collect_rule_files(parsed_signatures):
             candidates = [sig]
         else:
             if options.user_provided_signatures:
-                print('[!]\tSignature path does not exist: %s' % (sig))
+                logger.error('Signature path does not exist: %s', sig)
             continue
         for f in candidates:
             real = os.path.realpath(f)
@@ -899,15 +915,16 @@ def build_rules(parsed_signatures):
     _hash = rules_hash(file_list)
     path = os.path.join('/tmp/', '%s.yxc' % (_hash))
     if os.path.isfile(path):
-        print('[*]\tUp to date compiled rules already exist at %s. Using those' % (path))
+        logger.info('Up to date compiled rules already exist at %s. Using those', path)
         with open(path, 'rb') as fp:
             return yx.Rules.deserialize_from(fp), this_rule_filter, path
 
     start = time()
-    c = yx.Compiler(relaxed_re_syntax=True)
+    c = yx.Compiler()
     c.define_global('path', "TEMPORARY_EXT_VAR_VALUE")
     c.define_global('normalized_path', "TEMPORARY_EXT_VAR_VALUE")
     ok = 0
+    failed = 0
     for rulefile in file_list:
         ns = os.path.splitext(os.path.basename(rulefile))[0]
         c.new_namespace(ns)
@@ -916,11 +933,14 @@ def build_rules(parsed_signatures):
                 c.add_source(fp.read(), origin=rulefile)
             ok += 1
         except Exception as e:
-            print('rule %s failed to compile! Error: %s' % (rulefile, e))
+            failed += 1
+            logger.error('rule %s failed to compile! Error: %s', rulefile, e)
+    if failed:
+        logger.error('%d of %d rule file(s) failed to compile', failed, len(file_list))
     try:
         compiled_rules = c.build()
     except Exception as e:
-        print('Exception in Compiler.build(): %s' % e)
+        logger.error('Exception in Compiler.build(): %s', e)
         raise
     elapsed = time() - start
     try:
@@ -928,12 +948,11 @@ def build_rules(parsed_signatures):
             compiled_rules.serialize_into(fp)
         os.chmod(path, 0o666)
     except Exception as e:
-        print('[!]\tFailed to save compiled rules %s: %s' % (path,e))
+        logger.error('Failed to save compiled rules %s: %s', path, e)
     compiled_size = os.stat(path).st_size
 
-    if options.performance:
-        print('[*]\tCompiled %s / %s rule files in %s seconds.' % (ok, len(file_list), round(elapsed,2)))
-        print('[*]\tCompiled rule size is %s' % (human_size(compiled_size,)))
+    logger.info('Compiled %s / %s rule files in %s seconds.', ok, len(file_list), round(elapsed, 2))
+    logger.info('Compiled rule size is %s', human_size(compiled_size))
     return compiled_rules, this_rule_filter, path
 
 def offset_to_line(fname, offset, match_len):
@@ -1067,9 +1086,8 @@ def format_string_output(string, offset=None, fname=None, context=0, line=False)
             #fseek and grab context bytes, add color markers
             pass
         except:
-            print('Failed to get context for %s %s %s' % (fname, offset, string))
-            import traceback
-            print(traceback.format_exc())
+            logger.warning('Failed to get context for %s %s %s', fname, offset, string)
+            logger.debug('context failure traceback', exc_info=True)
             
     wide = False 
     if printable_wide.match(string):
@@ -1127,7 +1145,7 @@ if __name__ == '__main__':
         import r2pipe
 
     if options.performance:
-        print('[*]\tScanning with %s threads.' % (options.num_threads))
+        logger.info('Scanning with %s threads.', options.num_threads)
 
     # Collect scan targets and pre-compute total size for progress reporting.
     scanlist = []
@@ -1149,10 +1167,10 @@ if __name__ == '__main__':
     # --features rules-profiling`; see README.
     if options.profile:
         if not _profile_supported():
-            print('[!]\tThis yara-x wheel was built without the rules-profiling feature.')
-            print('[!]\tBuild the profiling-enabled wheel:')
-            print('[!]\t    cd ~/tools/yara-x/py && maturin build --release --features rules-profiling')
-            print('[!]\t    pip install --user --force-reinstall --no-deps ../target/wheels/yara_x-*.whl')
+            logger.error('This yara-x wheel was built without the rules-profiling feature. '
+                         'Build the profiling-enabled wheel:\n'
+                         '\tcd ~/tools/yara-x/py && maturin build --release --features rules-profiling\n'
+                         '\tpip install --user --force-reinstall --no-deps ../target/wheels/yara_x-*.whl')
             sys.exit(1)
         compiled_rules, rule_filter, yxc_path = build_rules(options.parsed_signatures)
         warnings_by_pattern = _collect_compile_warnings(options.parsed_signatures)
@@ -1206,7 +1224,7 @@ if __name__ == '__main__':
             progress.bytes_scanned += size
             progress.files_scanned += 1
             if err is not None:
-                print('Exception scanning %s (%s): %s' % (fname, human_size(size), err))
+                logger.error('Exception scanning %s (%s): %s', fname, human_size(size), err)
                 continue
             if matches:
                 progress.match_count += 1
@@ -1215,7 +1233,7 @@ if __name__ == '__main__':
                 results.append({'matches': [], 'fname': fname})
         ex.shutdown(wait=True)
     except KeyboardInterrupt:
-        print('\nInterrupted; killing workers and outputting results collected so far')
+        logger.warning('Interrupted; killing workers and outputting results collected so far')
         # yara-x's Rust scan_file() holds the GIL and doesn't check Python
         # signals, so ex.shutdown(wait=True) would block for however long a
         # worker's current scan takes to return -- can be minutes on huge
@@ -1291,25 +1309,24 @@ if __name__ == '__main__':
                                         try:
                                             print('        %s:0x%x:    %s' % (name, offset, string))
                                         except Exception as e:
-                                            print('error: %s' % (e))
+                                            logger.debug('failed to render match string: %s', e)
                                     else:
                                         try:
                                             print('        %s' % (string))
                                             continue
                                         except Exception as e:
-                                            print('error: %s' % (e))
+                                            logger.debug('failed to render match string: %s', e)
                                     if options.disassemble and string_dict[string]['printable']:
                                         try:
                                             dis = disassemble(res['fname'], string_dict[string]['bytes'], options.disassemble, context=options.context)
                                             print(' '*12 + dis.replace('\n', '\n' + ' '*12))
                                         except Exception as e:
-                                            print('Failed to disassemble %s: %s' % (string_dict[string]['bytes'], e))
-                                            import traceback
-                                            print(traceback.format_exc())
+                                            logger.warning('Failed to disassemble %s: %s', string_dict[string]['bytes'], e)
+                                            logger.debug('disassemble failure traceback', exc_info=True)
                     print()
     
     if options.performance:
         elapsed = time() - progress.start
         rate = human_size(progress.bytes_scanned / elapsed) if elapsed > 0 else 'N/A'
-        print('[*]\tProcessed %s files in %s seconds. %s/s' % (
-            progress.files_scanned, round(elapsed, 2), rate))
+        logger.info('Processed %s files in %s seconds. %s/s',
+                    progress.files_scanned, round(elapsed, 2), rate)
