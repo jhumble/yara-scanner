@@ -757,6 +757,30 @@ def human_size(nbytes):
     f = ('%s' % float('%.3g' % nbytes)).rstrip('0').rstrip('.')
     return '%s %s' % (f, suffixes[i])
 
+_mime_cache = {}
+_magic_mime = None
+
+def get_mime_type(path):
+    """MIME type of path, as ICE's file_type_analysis computes it.
+
+    Only called when a rule actually carries a mime_type directive, and cached
+    per path so repeated matches on one file do not re-stat it.
+    """
+    if path in _mime_cache:
+        return _mime_cache[path]
+    global _magic_mime
+    value = ''
+    try:
+        if _magic_mime is None:
+            import magic
+            _magic_mime = magic.Magic(mime=True)
+        value = _magic_mime.from_file(path).strip()
+    except Exception:
+        # Unreadable file or python-magic missing -- ICE treats this as "".
+        pass
+    _mime_cache[path] = value
+    return value
+
 def filter_match(match, fname, rule_filter=None):
     if rule_filter is None:
         # Fall back to the module-level default (main-block scenario).
@@ -769,49 +793,54 @@ def filter_match(match, fname, rule_filter=None):
                 allowed = rule_filter.get(match.namespace)
             if allowed is not None and match.rule not in allowed:
                 return True
-        for key in ['file_name', 'full_path']:
-            if key in match.meta:
-                passed = False         
-                negate = False
-                value = match.meta[key].lower()
-                if value.startswith('!'):
-                    value = value[1:]
-                    negate = True
-                for search in value.split(','):
-                    if key == 'file_name':
-                        fname = os.path.basename(fname)
-                    if 'sub:' in search:
-                        ns = search.replace('sub:', '')
-                        if ns in fname.lower():
-                            #print(f'{ns} in {fname}')
-                            passed = True
-                    else:
-                        if (search == fname.lower() and not negate) or (search != fname.lower() and negate):
-                            passed = True
+        # Output-selection directives. Mirrors ICE's
+        # yara_scanner.YaraScanner.is_match_valid() -- ICE is the standard, this
+        # is a replica for local rule development. Spec:
+        # https://krakenlibrary.atlassian.net/wiki/spaces/IDR/pages/44794043
+        basename = os.path.basename(fname)
+        directive_target = {
+            'file_ext': basename.split('.', 1)[1] if '.' in basename else '',
+            'file_name': basename,
+            'full_path': fname,
+            'mime_type': None,          # resolved lazily, only if a rule asks
+        }
 
-                if (not passed and not negate) or (passed and negate):
-                    return True 
-                """
-                if not passed:
-                    if negate:
-                        return False
-                    else:
-                        return True
-                """
+        for directive, value in match.meta.items():
+            directive = directive.lower()
+            if directive not in directive_target or not isinstance(value, str):
+                continue
 
-        if 'file_ext' in match.meta:
-            passed = False
-            negate = False
-            value = match.meta['file_ext'].lower()
+            # Invert logic by starting value with !
+            inverted = False
             if value.startswith('!'):
                 value = value[1:]
-                negate = True
-            for search in value.split(','):
-                if fname.lower().endswith(search):
-                    passed = True
-            if (not passed and not negate) or (passed and negate):
-                return True 
-            
+                inverted = True
+
+            # Case insensitive full string match by default
+            compare = lambda v, target: v.lower() == target.lower()
+
+            # Use regex by starting string with re:
+            if value.startswith('re:'):
+                value = value[3:]
+                compare = lambda v, target: re.search(v, target, re.IGNORECASE) is not None
+
+            # Use substring matching with sub:
+            elif value.startswith('sub:'):
+                value = value[4:]
+                compare = lambda v, target: v.lower() in target.lower()
+
+            target = directive_target[directive]
+            if target is None:
+                target = directive_target[directive] = get_mime_type(fname)
+
+            matched = False
+            for v in [x.strip() for x in value.lower().split(',')]:
+                matched |= compare(v, target)
+
+            # Inverted and matched, or not inverted and not matched -> drop it
+            if inverted == matched:
+                return True
+
         return False
     except Exception as e:
         import traceback
