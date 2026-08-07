@@ -935,14 +935,23 @@ def build_rules(parsed_signatures):
         except Exception as e:
             failed += 1
             logger.error('rule %s failed to compile! Error: %s', rulefile, e)
-    if failed:
-        logger.error('%d of %d rule file(s) failed to compile', failed, len(file_list))
     try:
         compiled_rules = c.build()
     except Exception as e:
         logger.error('Exception in Compiler.build(): %s', e)
         raise
     elapsed = time() - start
+    if failed:
+        logger.error('%d of %d rule file(s) failed to compile', failed, len(file_list))
+        # The scan/-P workers deserialize the rules from a path, so we still have
+        # to write them to disk -- but to a *non-canonical* filename. Next run's
+        # cache check looks for `path`, misses, and recompiles, so the compile
+        # errors are re-reported on every run until they're fixed rather than
+        # being silently cached over. (Fixing the rules -> clean compile ->
+        # normal cached path resumes.)
+        path = path + '.partial'
+        logger.info('Not caching to %s because %d rule file(s) failed to compile; '
+                    'will recompile next run.', _hash + '.yxc', failed)
     try:
         with open(path, 'wb') as fp:
             compiled_rules.serialize_into(fp)
