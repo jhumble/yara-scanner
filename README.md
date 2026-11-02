@@ -23,7 +23,7 @@ Roughly, compared to `yara`:
 | Sort samples by rule | no | `-C out_dir/` copies each matched file into `out_dir/<rule_name>/` for triage |
 | JSON output | no | `-j results.json` |
 | "Which files *didn't* match" | no | `-n` |
-| Per-rule file-name / path filtering | no | rule-level `file_name` / `full_path` / `file_ext` meta fields are auto-honored (supports `!` negation and `sub:` substring) |
+| Per-rule file-name / path filtering | no | rule-level `file_name` / `file_path` (alias `full_path`) / `file_ext` / `mime_type` meta fields are auto-honored (supports `!` negation and `sub:` substring) |
 | FP triage loop | manual diffing | `fp_analyzer.py` — runs a rule against a benign corpus and rewrites the rule with an annotated, commented-out version of every string that fired on benign data |
 
 ## Install
@@ -227,10 +227,10 @@ The `-c 0` above trims pre-match context so the disassembly starts right at the 
 
 ## Rule-side filtering via meta fields
 
-`yarascan.py` reads three optional `meta:` fields on each rule and uses them to suppress matches post-hoc. This lets you keep a rule narrow without polluting its `condition:` with path-shape checks.
+`yarascan.py` reads optional `meta:` fields on each rule and uses them to suppress matches post-hoc. This lets you keep a rule narrow without polluting its `condition:` with path-shape checks.
 
 - `file_name = "foo.exe"` — match only when the sample's basename is `foo.exe`
-- `full_path = "C:\\Windows\\foo.exe"` — match only against this full path
+- `file_path = "C:\\Windows\\foo.exe"` — match only against this full path (`full_path` is accepted as an alias)
 - `file_ext = "dll"` — match only for this extension
 
 Each supports:

@@ -818,7 +818,8 @@ def filter_match(match, fname, rule_filter=None):
         directive_target = {
             'file_ext': basename.split('.', 1)[1] if '.' in basename else '',
             'file_name': basename,
-            'full_path': fname,
+            'file_path': fname,         # ICE 2 name; the rules repo uses this
+            'full_path': fname,         # ICE 1 / ace yara_scanner name
             'mime_type': None,          # resolved lazily, only if a rule asks
         }
 
