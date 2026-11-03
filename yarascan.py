@@ -816,7 +816,7 @@ def filter_match(match, fname, rule_filter=None):
         # https://krakenlibrary.atlassian.net/wiki/spaces/IDR/pages/44794043
         basename = os.path.basename(fname)
         directive_target = {
-            'file_ext': basename.split('.', 1)[1] if '.' in basename else '',
+            'file_ext': basename.rsplit('.', 1)[1] if '.' in basename else '',  # ICE 2: last extension only
             'file_name': basename,
             'file_path': fname,         # ICE 2 name; the rules repo uses this
             'full_path': fname,         # ICE 1 / ace yara_scanner name

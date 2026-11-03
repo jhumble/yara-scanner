@@ -231,11 +231,11 @@ The `-c 0` above trims pre-match context so the disassembly starts right at the 
 
 - `file_name = "foo.exe"` — match only when the sample's basename is `foo.exe`
 - `file_path = "C:\\Windows\\foo.exe"` — match only against this full path (`full_path` is accepted as an alias)
-- `file_ext = "dll"` — match only for this extension
+- `file_ext = "dll"` — match only for this extension. As in ICE 2, the extension is the text after the **last** period: `x.rfc822.combined` is `combined`, `x.tar.gz` is `gz`
 
 Each supports:
 - **Comma-separated alternatives**: `file_ext = "exe,dll,sys"`
-- **Negation** with a leading `!`: `file_ext = "!txt,!md"`
+- **Negation** with a leading `!`, applying to the whole list: `file_ext = "!txt,md"`
 - **Substring** with `sub:`: `file_name = "sub:loader"` matches anything with `loader` in the name
 
 If the rule fires but the sample doesn't satisfy the filter, the match is dropped before it ever reaches output / categorization / JSON.
